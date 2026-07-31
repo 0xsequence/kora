@@ -262,7 +262,7 @@ export interface GetPaymentInstructionResponse {
  * Configuration Types
  */
 
-export type PriceSource = 'Jupiter' | 'Mock';
+export type PriceSource = 'CoinGecko' | 'Jupiter' | 'Mock';
 
 /**
  * Validation configuration for the Kora server.

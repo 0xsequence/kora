@@ -264,7 +264,7 @@ Returns server configuration including fee payers, validation rules, and enabled
   validation_config: {
     max_allowed_lamports: number;
     max_signatures: number;
-    price_source: 'Jupiter' | 'Mock';
+    price_source: 'CoinGecko' | 'Jupiter' | 'Mock';
     allowed_programs: string[];
     allowed_tokens: string[];
     allowed_spl_paid_tokens: string[];

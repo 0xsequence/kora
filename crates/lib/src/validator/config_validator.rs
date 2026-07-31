@@ -496,6 +496,25 @@ impl ConfigValidator {
             );
         }
 
+        // Validate CoinGecko API key is set when using CoinGecko price source
+        if matches!(config.validation.price_source, PriceSource::CoinGecko)
+            && std::env::var("COINGECKO_API_KEY").is_err()
+        {
+            errors.push(
+                "COINGECKO_API_KEY environment variable not set. Required when price_source = CoinGecko".to_string()
+            );
+        }
+
+        // CoinGecko is an off-chain aggregator and reports no Solana slot, so a staleness
+        // threshold could never be satisfied and every priced request would be rejected.
+        if matches!(config.validation.price_source, PriceSource::CoinGecko)
+            && config.validation.max_price_staleness_slots > 0
+        {
+            errors.push(
+                "max_price_staleness_slots must be 0 when price_source = CoinGecko. CoinGecko prices carry no block_id, so staleness cannot be verified".to_string()
+            );
+        }
+
         if config.validation.allow_durable_transactions {
             warnings.push(
                 "⚠️  SECURITY: allow_durable_transactions is enabled. \
@@ -3019,6 +3038,95 @@ mod tests {
         let errors = result.unwrap_err();
         assert!(errors.iter().any(|e| e.contains("JUPITER_API_KEY")));
         assert!(errors.iter().any(|e| e.contains("price_source = Jupiter")));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_coingecko_price_source_requires_api_key() {
+        // Ensure COINGECKO_API_KEY is not set
+        std::env::remove_var("COINGECKO_API_KEY");
+
+        let config = Config {
+            validation: ValidationConfig {
+                max_allowed_lamports: 1_000_000,
+                max_signatures: 10,
+                allowed_programs: ProgramsConfig::Allowlist(vec![
+                    SYSTEM_PROGRAM_ID.to_string(),
+                    SPL_TOKEN_PROGRAM_ID.to_string(),
+                ]),
+                allowed_tokens: vec!["4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string()],
+                allowed_spl_paid_tokens: SplTokenConfig::Allowlist(vec![
+                    "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string(),
+                ]),
+                disallowed_accounts: vec![],
+                price_source: PriceSource::CoinGecko, // CoinGecko requires API key
+                fee_payer_policy: FeePayerPolicy::default(),
+                price: PriceConfig::default(),
+                token_2022: Token2022Config::default(),
+                allow_durable_transactions: false,
+                max_price_staleness_slots: 0,
+                require_one_of_programs: vec![],
+                cross_cluster_check: false,
+                cross_cluster_endpoints: vec![],
+            },
+            kora: KoraConfig::default(),
+            metrics: MetricsConfig::default(),
+        };
+
+        let _ = update_config(config);
+
+        let rpc_client = RpcMockBuilder::new().build();
+        let result = ConfigValidator::validate_with_result(&rpc_client, true).await;
+
+        // Should fail because COINGECKO_API_KEY is not set
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("COINGECKO_API_KEY")));
+        assert!(errors.iter().any(|e| e.contains("price_source = CoinGecko")));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_coingecko_price_source_rejects_price_staleness_check() {
+        std::env::set_var("COINGECKO_API_KEY", "test-api-key");
+
+        let config = Config {
+            validation: ValidationConfig {
+                max_allowed_lamports: 1_000_000,
+                max_signatures: 10,
+                allowed_programs: ProgramsConfig::Allowlist(vec![
+                    SYSTEM_PROGRAM_ID.to_string(),
+                    SPL_TOKEN_PROGRAM_ID.to_string(),
+                ]),
+                allowed_tokens: vec!["4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string()],
+                allowed_spl_paid_tokens: SplTokenConfig::Allowlist(vec![
+                    "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string(),
+                ]),
+                disallowed_accounts: vec![],
+                price_source: PriceSource::CoinGecko,
+                fee_payer_policy: FeePayerPolicy::default(),
+                price: PriceConfig::default(),
+                token_2022: Token2022Config::default(),
+                allow_durable_transactions: false,
+                max_price_staleness_slots: 150, // Unsupported: CoinGecko has no block_id
+                require_one_of_programs: vec![],
+                cross_cluster_check: false,
+                cross_cluster_endpoints: vec![],
+            },
+            kora: KoraConfig::default(),
+            metrics: MetricsConfig::default(),
+        };
+
+        let _ = update_config(config);
+
+        let rpc_client = RpcMockBuilder::new().build();
+        let result = ConfigValidator::validate_with_result(&rpc_client, true).await;
+
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("max_price_staleness_slots must be 0")));
+
+        std::env::remove_var("COINGECKO_API_KEY");
     }
 
     #[tokio::test]

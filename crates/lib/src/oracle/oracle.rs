@@ -1,6 +1,6 @@
 use crate::{
     error::KoraError,
-    oracle::{jupiter::JupiterPriceOracle, utils::OracleUtil},
+    oracle::{coingecko::CoinGeckoPriceOracle, jupiter::JupiterPriceOracle, utils::OracleUtil},
 };
 use mockall::automock;
 use reqwest::Client;
@@ -22,6 +22,7 @@ pub struct TokenPrice {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
 pub enum PriceSource {
     Jupiter,
+    CoinGecko,
     Mock,
 }
 
@@ -31,6 +32,7 @@ impl PriceSource {
     pub fn as_cache_key(&self) -> &'static str {
         match self {
             PriceSource::Jupiter => "jupiter",
+            PriceSource::CoinGecko => "coingecko",
             PriceSource::Mock => "mock",
         }
     }
@@ -64,6 +66,7 @@ pub fn get_price_oracle(
 ) -> Result<Arc<dyn PriceOracle + Send + Sync>, KoraError> {
     match source {
         PriceSource::Jupiter => Ok(Arc::new(JupiterPriceOracle::new()?)),
+        PriceSource::CoinGecko => Ok(Arc::new(CoinGeckoPriceOracle::new()?)),
         PriceSource::Mock => Ok(OracleUtil::get_mock_oracle_price()),
     }
 }

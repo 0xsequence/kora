@@ -1,3 +1,4 @@
+pub mod coingecko;
 pub mod jupiter;
 pub mod oracle;
 pub mod utils;

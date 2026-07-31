@@ -877,10 +877,13 @@ mod tests {
     async fn test_get_price_key_format() {
         let mint = Pubkey::new_unique().to_string();
         let jupiter_key = CacheUtil::get_price_key(&mint, &PriceSource::Jupiter);
+        let coingecko_key = CacheUtil::get_price_key(&mint, &PriceSource::CoinGecko);
         let mock_key = CacheUtil::get_price_key(&mint, &PriceSource::Mock);
         assert_eq!(jupiter_key, format!("kora:price:jupiter:{mint}"));
+        assert_eq!(coingecko_key, format!("kora:price:coingecko:{mint}"));
         assert_eq!(mock_key, format!("kora:price:mock:{mint}"));
         assert_ne!(jupiter_key, mock_key);
+        assert_ne!(jupiter_key, coingecko_key);
     }
 
     #[tokio::test]

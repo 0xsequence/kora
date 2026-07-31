@@ -71,7 +71,7 @@ rate_limit = 100
 [validation]
 max_allowed_lamports = 1000000
 max_signatures = 10
-price_source = "Mock"  # or "Jupiter" (requires JUPITER_API_KEY env var)
+price_source = "Mock"  # or "Jupiter" / "CoinGecko" (each requires its own API key env var)
 
 allowed_programs = [
     "11111111111111111111111111111111",

@@ -179,7 +179,7 @@ When enabled, the returned transaction message may be modified (balance assertio
 [validation]
 max_allowed_lamports = 1000000     # Max transaction value in lamports
 max_signatures = 10                # Max signatures per transaction
-price_source = "Mock"              # "Mock" or "Jupiter" (requires JUPITER_API_KEY)
+price_source = "Mock"              # "Mock", "Jupiter", or "CoinGecko" (both require an API key)
 allow_durable_transactions = false # Allow durable nonce transactions (security risk!)
 
 # Program allowlist (by public key)
@@ -203,6 +203,8 @@ disallowed_accounts = []
 **`price_source`**:
 - `"Mock"`: Fixed 1:1 price ratio (testing/development)
 - `"Jupiter"`: Live Jupiter API prices (production). Requires `JUPITER_API_KEY` env var.
+- `"CoinGecko"`: Live CoinGecko Pro API prices (production). Requires `COINGECKO_API_KEY` env
+  var. CoinGecko reports no Solana slot, so `max_price_staleness_slots` must be `0`.
 
 **`allow_durable_transactions`**: Allows nonce-based transactions. Security risk: transactions can be replayed after nonce advance.
 

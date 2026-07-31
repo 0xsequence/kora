@@ -23,6 +23,7 @@ pub const DEFAULT_PROTECTED_METHODS: &[&str] =
 
 // External Services
 pub const JUPITER_API_URL: &str = "https://api.jup.ag";
+pub const COINGECKO_API_URL: &str = "https://pro-api.coingecko.com/api/v3";
 pub const RECAPTCHA_VERIFY_URL: &str = "https://www.google.com/recaptcha/api/siteverify";
 pub const RECAPTCHA_TIMEOUT_SECS: u64 = 5;
 
