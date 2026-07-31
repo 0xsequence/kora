@@ -1066,6 +1066,18 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_sponsor_fee_price_config() {
+        let config = ConfigBuilder::new().with_sponsor_fee_price().build_config().unwrap();
+
+        match &config.validation.price.model {
+            PriceModel::SponsorFee => {
+                // Test passed
+            }
+            _ => panic!("Expected SponsorFee price model"),
+        }
+    }
+
+    #[test]
     fn test_parse_missing_price_config() {
         let config = ConfigBuilder::new().build_config().unwrap();
 

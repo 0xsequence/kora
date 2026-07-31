@@ -306,9 +306,13 @@ export interface Token2022Config {
  * - `margin`: Adds a percentage margin to base fees
  * - `fixed`: Charges a fixed amount in a specific token
  * - `free`: No additional fees charged
+ * - `sponsorfee`: Sponsors network fees, charges only fee payer outflow
  */
 export type PriceModel =
-    { amount: number; token: string; type: 'fixed' } | { margin: number; type: 'margin' } | { type: 'free' };
+    | { amount: number; token: string; type: 'fixed' }
+    | { margin: number; type: 'margin' }
+    | { type: 'free' }
+    | { type: 'sponsorfee' };
 
 export type PriceConfig = PriceModel;
 

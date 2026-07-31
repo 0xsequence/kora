@@ -137,9 +137,9 @@ impl TransactionPlugin for GasSwapPlugin {
         if config.validation.allowed_tokens.is_empty() {
             errors.push("GasSwap plugin requires at least one token in allowed_tokens".to_string());
         }
-        if matches!(config.validation.price.model, PriceModel::Free) {
+        if matches!(config.validation.price.model, PriceModel::Free | PriceModel::SponsorFee) {
             errors.push(
-                "GasSwap plugin cannot be used with Free pricing; set a margin or fixed price"
+                "GasSwap plugin cannot be used with Free pricing or SponsorFee pricing; set a margin or fixed price"
                     .to_string(),
             );
         }

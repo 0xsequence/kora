@@ -136,7 +136,7 @@ allow_deactivate = false        # Allow fee payer to be authority in ALT Deactiv
 allow_close = false             # Allow fee payer to be authority in ALT CloseLookupTable
 
 [validation.price]
-type = "margin" # free / margin / fixed
+type = "margin" # free / margin / fixed / sponsorfee
 margin = 0.1  # 10% margin (0.1 = 10%, 1.0 = 100%)
 
 [validation.token_2022]

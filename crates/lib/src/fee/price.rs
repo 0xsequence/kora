@@ -15,6 +15,7 @@ pub enum PriceModel {
     Margin { margin: f64 },
     Fixed { amount: u64, token: String, strict: bool },
     Free,
+    SponsorFee,
 }
 
 impl Default for PriceModel {
@@ -217,6 +218,42 @@ mod tests {
         // 0.001 USDC * 0.0075 SOL/USDC = 0.0000075 SOL
         // 0.0000075 SOL * 1,000,000,000 lamports/SOL = 7,500 lamports
         assert_eq!(result, 7500);
+    }
+
+    #[tokio::test]
+    async fn test_sponsor_fee_model_rejects_margin_helper() {
+        // SponsorFee derives its charge from the fee payer outflow, not from a margin, so
+        // the margin helper must refuse to compute a price for it.
+        let price_config = PriceConfig { model: PriceModel::SponsorFee };
+
+        let result = price_config.get_required_lamports_with_margin(5000).await;
+
+        assert!(matches!(result, Err(KoraError::ConfigError(_))));
+    }
+
+    #[tokio::test]
+    async fn test_sponsor_fee_model_rejects_fixed_helper() {
+        let _m = ConfigMockBuilder::new().build_and_setup();
+        let config = get_config().unwrap();
+        let rpc_client = create_mock_rpc_client_with_mint(6);
+
+        let price_config = PriceConfig { model: PriceModel::SponsorFee };
+
+        let result = price_config.get_required_lamports_with_fixed(&rpc_client, &config).await;
+
+        assert!(matches!(result, Err(KoraError::ConfigError(_))));
+    }
+
+    #[test]
+    fn test_sponsor_fee_model_serde_round_trip() {
+        // The serde tag is derived from the variant name via rename_all = "lowercase".
+        let json = r#"{"type":"sponsorfee"}"#;
+
+        let price_config: PriceConfig = serde_json::from_str(json).unwrap();
+        assert!(matches!(price_config.model, PriceModel::SponsorFee));
+
+        let serialized = serde_json::to_string(&price_config).unwrap();
+        assert_eq!(serialized, json);
     }
 
     #[tokio::test]

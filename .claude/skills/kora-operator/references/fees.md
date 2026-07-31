@@ -65,6 +65,42 @@ type = "free"
 - Does NOT include fee payer outflow in payment validation
 - **Security risk**: Fee payer SOL can be drained if transfers not restricted
 
+### Sponsor Fee
+
+```toml
+[validation.price]
+type = "sponsorfee"
+```
+
+- Sponsors the base network fee, Kora's signature fee, and the payment instruction overhead
+- **Does** charge fee payer outflow, plus the Token-2022 repayment transfer-fee gross-up
+- No markup is applied to either component; use `margin` or `fixed` for a markup
+- When a transaction makes the fee payer front nothing, the required payment is zero and
+  the transaction is signed without any repayment, exactly like `free`
+- Unlike `free` and `fixed`, fee payer outflow **is** recovered, so rent-exempt deposits
+  cannot be used to drain the fee payer
+
+**Formula**: `total = outflow + transfer_fee`
+
+**Worked example** — sponsor the transaction fee, still charge for a recipient's new ATA:
+
+A client sends USDC to a recipient who has no Associated Token Account yet, so the
+transaction includes a `create_associated_token_account` instruction funded by Kora's fee
+payer.
+
+| Component | Lamports | Billed? |
+| --- | --- | --- |
+| `base_fee` (network, per signature) | 5,000 | sponsored |
+| `kora_signature_fee` | 0 | sponsored |
+| `payment_instruction_fee` | 50 | sponsored |
+| `fee_payer_outflow` (ATA rent-exempt deposit) | 2,039,280 | **charged** |
+| `transfer_fee_amount` | 0 | **charged** (zero here) |
+
+The client is asked to repay 2,039,280 lamports' worth of the payment token — the ATA
+deposit only. The 5,050 lamports of network and payment-instruction cost are absorbed by
+the operator. Had the recipient already owned an ATA, `fee_payer_outflow` would be 0 and
+the client would owe nothing at all.
+
 ---
 
 ## Security Considerations

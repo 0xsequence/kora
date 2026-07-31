@@ -754,6 +754,14 @@ impl ConfigValidator {
                     warnings.push(format!("Margin is {}% - this is very high", margin * 100.0));
                 }
             }
+            PriceModel::SponsorFee => {
+                warnings.push(
+                    "⚠️  SECURITY: Sponsor pricing model enabled - network and signature fees \
+                    are never charged, so any transaction that does not make the fee payer \
+                    front lamports is processed for free."
+                        .to_string(),
+                );
+            }
             _ => {}
         };
 
@@ -1553,6 +1561,22 @@ mod tests {
             .unwrap_err()
             .iter()
             .any(|e| e.contains("GasSwap plugin cannot be used with Free pricing")));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_gas_swap_plugin_rejects_sponsor_fee_pricing() {
+        let mut config = ConfigMockBuilder::new().build();
+        config.kora.cache.enabled = false;
+        config.kora.plugins.enabled = vec![TransactionPluginType::GasSwap];
+        config.validation.price = PriceConfig { model: PriceModel::SponsorFee };
+
+        let _ = update_config(config);
+
+        let rpc_client = RpcMockBuilder::new().build();
+        let result = ConfigValidator::validate_with_result(&rpc_client, true).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().iter().any(|e| e.contains("SponsorFee pricing")));
     }
 
     #[tokio::test]

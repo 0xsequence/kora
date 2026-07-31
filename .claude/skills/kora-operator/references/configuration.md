@@ -284,7 +284,7 @@ allow_thaw_account = false
 
 ## Pricing
 
-Three models:
+Four models:
 
 ### Margin (default, recommended)
 
@@ -316,6 +316,18 @@ type = "free"
 ```
 
 No charge. Does NOT include fee payer outflow. Must secure fee payer policy.
+
+### Sponsor Fee
+
+```toml
+[validation.price]
+type = "sponsorfee"
+```
+
+Sponsors the network fee, signature fee, and payment instruction overhead, but DOES charge
+fee payer outflow (plus the Token-2022 repayment transfer-fee gross-up), with no markup.
+Use when the network fee should always be free but a recipient's new ATA rent deposit must
+still be repaid. Requires no repayment at all when the fee payer fronts nothing.
 
 ---
 

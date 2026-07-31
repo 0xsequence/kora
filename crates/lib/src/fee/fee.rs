@@ -340,6 +340,47 @@ impl FeeConfigUtil {
                     fee_calculation.transfer_fee_amount,
                 ))
             }
+            PriceModel::SponsorFee => {
+                let fee_calculation = Self::estimate_transaction_fee(
+                    transaction,
+                    fee_payer,
+                    is_payment_required,
+                    rpc_client,
+                    config,
+                    bundle_instructions,
+                )
+                .await?;
+
+                // Sponsor the base fee, Kora's signature fee, and the payment instruction
+                // overhead. Only bill what the fee payer actually fronts plus the Token2022
+                // repayment gross-up, with no markup applied.
+                let total_fee_lamports = fee_calculation
+                    .fee_payer_outflow
+                    .checked_add(fee_calculation.transfer_fee_amount as i128)
+                    .map(|sum| sum.max(0) as u64)
+                    .ok_or_else(|| {
+                        log::error!(
+                            "Fee calculation overflow: fee_payer_outflow={}, transfer_fee_amount={}",
+                            fee_calculation.fee_payer_outflow,
+                            fee_calculation.transfer_fee_amount
+                        );
+                        KoraError::ValidationError("Fee calculation overflow".to_string())
+                    })?;
+
+                // Report a zero payment instruction fee because it was sponsored rather than
+                // billed. The bundle fee accounting treats a non-zero value as "this
+                // transaction was charged a missing-payment penalty" and subtracts the
+                // duplicates back out, so leaving the estimate here would deduct a penalty
+                // that was never added to total_fee_lamports.
+                Ok(TotalFeeCalculation::new(
+                    total_fee_lamports,
+                    fee_calculation.base_fee,
+                    fee_calculation.kora_signature_fee,
+                    fee_calculation.fee_payer_outflow,
+                    0,
+                    fee_calculation.transfer_fee_amount,
+                ))
+            }
         }
     }
 
@@ -1753,6 +1794,144 @@ mod tests {
         assert_eq!(
             fee_calculation.total_fee_lamports, 2_010_000,
             "Margin pricing should include the full ALT close lamports in the quoted fee"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_estimate_kora_fee_sponsor_fee_charges_only_outflow() {
+        let mut config = ConfigMockBuilder::new().with_cache_enabled(false).build();
+        config.validation.price = PriceConfig { model: PriceModel::SponsorFee };
+        let _m =
+            ConfigMockBuilder::new().with_validation(config.validation.clone()).build_and_setup();
+
+        let fee_payer = Pubkey::new_unique();
+        let lookup_table_account = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        let alt_account = AccountMockBuilder::new()
+            .with_owner(ADDRESS_LOOKUP_TABLE_PROGRAM_ID)
+            .with_lamports(2_000_000)
+            .build();
+        let mocked_rpc_client =
+            RpcMockBuilder::new().with_account_info(&alt_account).with_fee_estimate(10_000).build();
+
+        let mut resolved_transaction = create_alt_close_resolved_transaction(
+            &fee_payer,
+            &fee_payer,
+            &lookup_table_account,
+            &recipient,
+        );
+        let fee_calculation = FeeConfigUtil::estimate_kora_fee(
+            &mut resolved_transaction,
+            &fee_payer,
+            false,
+            &mocked_rpc_client,
+            &config,
+            TransferHookValidationFlow::DelayedSigning,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(fee_calculation.base_fee, 10_000);
+        assert_eq!(fee_calculation.fee_payer_outflow, 2_000_000);
+        assert_eq!(
+            fee_calculation.total_fee_lamports, 2_000_000,
+            "Sponsor pricing should bill the fee payer outflow but sponsor the base fee"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_estimate_kora_fee_sponsor_fee_requires_nothing_without_outflow() {
+        let mut config = ConfigMockBuilder::new().with_cache_enabled(false).build();
+        config.validation.price = PriceConfig { model: PriceModel::SponsorFee };
+        let _m =
+            ConfigMockBuilder::new().with_validation(config.validation.clone()).build_and_setup();
+
+        let fee_payer = Pubkey::new_unique();
+        let other_authority = Pubkey::new_unique();
+        let lookup_table_account = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        let alt_account = AccountMockBuilder::new()
+            .with_owner(ADDRESS_LOOKUP_TABLE_PROGRAM_ID)
+            .with_lamports(2_000_000)
+            .build();
+        let mocked_rpc_client =
+            RpcMockBuilder::new().with_account_info(&alt_account).with_fee_estimate(10_000).build();
+
+        // The fee payer is neither the closing authority nor the recipient, so it fronts
+        // nothing and only the sponsored base fee remains.
+        let mut resolved_transaction = create_alt_close_resolved_transaction(
+            &fee_payer,
+            &other_authority,
+            &lookup_table_account,
+            &recipient,
+        );
+        let fee_calculation = FeeConfigUtil::estimate_kora_fee(
+            &mut resolved_transaction,
+            &fee_payer,
+            false,
+            &mocked_rpc_client,
+            &config,
+            TransferHookValidationFlow::DelayedSigning,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(fee_calculation.base_fee, 10_000);
+        assert_eq!(fee_calculation.fee_payer_outflow, 0);
+        assert_eq!(
+            fee_calculation.total_fee_lamports, 0,
+            "Sponsor pricing should require no repayment when the fee payer fronts nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_estimate_kora_fee_sponsor_fee_sponsors_payment_instruction_overhead() {
+        let mut config = ConfigMockBuilder::new().with_cache_enabled(false).build();
+        config.validation.price = PriceConfig { model: PriceModel::SponsorFee };
+        let _m =
+            ConfigMockBuilder::new().with_validation(config.validation.clone()).build_and_setup();
+
+        let fee_payer = Pubkey::new_unique();
+        let other_authority = Pubkey::new_unique();
+        let lookup_table_account = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        let alt_account = AccountMockBuilder::new()
+            .with_owner(ADDRESS_LOOKUP_TABLE_PROGRAM_ID)
+            .with_lamports(2_000_000)
+            .build();
+        let mocked_rpc_client =
+            RpcMockBuilder::new().with_account_info(&alt_account).with_fee_estimate(10_000).build();
+
+        let mut resolved_transaction = create_alt_close_resolved_transaction(
+            &fee_payer,
+            &other_authority,
+            &lookup_table_account,
+            &recipient,
+        );
+        // is_payment_required = true with no payment instruction present, which is what
+        // ValidationConfig::is_payment_required() reports for any non-Free model.
+        let fee_calculation = FeeConfigUtil::estimate_kora_fee(
+            &mut resolved_transaction,
+            &fee_payer,
+            true,
+            &mocked_rpc_client,
+            &config,
+            TransferHookValidationFlow::DelayedSigning,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            fee_calculation.total_fee_lamports, 0,
+            "Sponsor pricing should not bill the payment instruction overhead"
+        );
+        assert_eq!(
+            fee_calculation.payment_instruction_fee, 0,
+            "A sponsored payment instruction must report zero so bundle accounting does not \
+             subtract a penalty that was never charged"
         );
     }
 

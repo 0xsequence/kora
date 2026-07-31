@@ -434,7 +434,10 @@ impl UsageTracker {
     ) -> Result<(), KoraError> {
         // Validate user_id is provided when required
         if config.kora.usage_limit.enabled
-            && matches!(&config.validation.price.model, crate::fee::price::PriceModel::Free)
+            && matches!(
+                &config.validation.price.model,
+                crate::fee::price::PriceModel::Free | crate::fee::price::PriceModel::SponsorFee
+            )
             && user_id.is_none()
         {
             return Err(KoraError::ValidationError(
@@ -887,6 +890,34 @@ mod tests {
             Err(e) => println!("Test failed with error: {e}"),
         }
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_usage_limiter_requires_user_id_for_sponsor_fee_pricing() {
+        // SponsorFee charges nothing when the fee payer fronts no lamports, so usage has to
+        // be attributed explicitly just as it does under Free pricing.
+        let _m = ConfigMockBuilder::new()
+            .with_usage_limit_enabled(true)
+            .with_price_model(crate::fee::price::PriceModel::SponsorFee)
+            .build_and_setup();
+
+        let _ = UsageTracker::init_usage_limiter().await;
+
+        let config = get_config().unwrap();
+        let mut tx = create_mock_resolved_transaction();
+        let rpc_client = Arc::new(RpcMockBuilder::new().build());
+        let fee_payer = Pubkey::new_unique();
+        let result = UsageTracker::check_transaction_usage_limit(
+            &config,
+            &mut tx,
+            None,
+            &fee_payer,
+            &rpc_client,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("user_id is required"));
     }
 
     #[tokio::test]

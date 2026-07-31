@@ -129,6 +129,12 @@ impl ConfigBuilder {
         self
     }
 
+    pub fn with_sponsor_fee_price(mut self) -> Self {
+        self.validation.price_config =
+            Some("[validation.price]\ntype = \"sponsorfee\"\n".to_string());
+        self
+    }
+
     pub fn with_invalid_price(mut self, price_type: &str) -> Self {
         self.validation.price_config =
             Some(format!("[validation.price]\ntype = \"{price_type}\"\nmargin = 0.1\n"));
