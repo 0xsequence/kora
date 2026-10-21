@@ -46,6 +46,10 @@ pub struct SignTransactionResponse {
     pub signed_transaction: String,
     /// Public key of the signer used (for client consistency)
     pub signer_pubkey: String,
+    /// Whether a Lighthouse fee payer assertion was appended to the message before signing.
+    /// Reports only the assertion. It is not a statement that the message is otherwise
+    /// unchanged: a request with an empty signature array also gets a fresh blockhash.
+    pub lighthouse_assertion_added: bool,
 }
 
 pub async fn sign_transaction(
@@ -69,7 +73,6 @@ pub async fn sign_transaction(
     )
     .await?;
 
-    // Check usage limit for transaction sender
     UsageTracker::check_transaction_usage_limit(
         config,
         &mut resolved_transaction,
@@ -79,7 +82,7 @@ pub async fn sign_transaction(
     )
     .await?;
 
-    let (signed_transaction, _) =
+    let (signed_transaction, _, lighthouse_assertion_added) =
         resolved_transaction.sign_transaction(config, &signer, rpc_client, false).await?;
 
     let encoded = TransactionUtil::encode_versioned_transaction(&signed_transaction)?;
@@ -87,6 +90,7 @@ pub async fn sign_transaction(
     Ok(SignTransactionResponse {
         signed_transaction: encoded,
         signer_pubkey: signer.pubkey().to_string(),
+        lighthouse_assertion_added,
     })
 }
 
@@ -109,6 +113,7 @@ mod tests {
     use solana_compute_budget_interface::ComputeBudgetInstruction;
     use solana_message::{Message, VersionedMessage};
     use solana_sdk::pubkey::Pubkey;
+    use solana_transaction::versioned::TransactionVersion;
     use std::str::FromStr;
 
     fn create_compute_budget_only_encoded_transaction() -> String {
@@ -194,5 +199,30 @@ mod tests {
         let pool = get_signer_pool().unwrap();
         assert!(!pool.probe_in_flight(&target_pubkey).unwrap());
         assert!(pool.get_signer_by_pubkey(&target_pubkey.to_string()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_sign_transaction_rejects_disallowed_transaction_version() {
+        let _m = ConfigMockBuilder::new()
+            .with_allowed_transaction_versions(vec![TransactionVersion::Number(0)])
+            .build_and_setup();
+        let _ = setup_or_get_test_signer();
+        let _ = setup_or_get_test_usage_limiter().await;
+
+        let rpc_client = Arc::new(RpcMockBuilder::new().with_simulation().build());
+
+        let request = SignTransactionRequest {
+            transaction: create_mock_encoded_transaction(),
+            signer_key: None,
+            sig_verify: false,
+            user_id: None,
+        };
+
+        let result = sign_transaction(&rpc_client, request).await;
+
+        assert_eq!(
+            result.unwrap_err(),
+            KoraError::InvalidTransaction("Transaction version is not allowed".to_string())
+        );
     }
 }

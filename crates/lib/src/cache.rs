@@ -35,7 +35,6 @@ const PRICE_ORACLE_MAX_RETRIES: u32 = 3;
 /// Base delay for the price oracle retry loop.
 const PRICE_ORACLE_BASE_DELAY: Duration = Duration::from_secs(1);
 
-/// Global cache pool instance
 static CACHE_POOL: OnceCell<Option<Pool>> = OnceCell::const_new();
 
 /// Process-wide price oracle. Held as an `Arc` so the inner `reqwest::Client`
@@ -83,7 +82,6 @@ impl CacheUtil {
                 ))
             })?;
 
-            // Test connection
             let mut conn = pool.get().await.map_err(|e| {
                 KoraError::InternalServerError(format!(
                     "Failed to connect to cache: {}",
@@ -91,7 +89,6 @@ impl CacheUtil {
                 ))
             })?;
 
-            // Simple connection test - try to get a non-existent key
             let _: Option<String> = conn.get("__connection_test__").await.map_err(|e| {
                 KoraError::InternalServerError(format!(
                     "Cache connection test failed: {}",
@@ -132,21 +129,12 @@ impl CacheUtil {
         rpc_client: &RpcClient,
         pubkey: &Pubkey,
     ) -> Result<Account, KoraError> {
-        match rpc_client.get_account(pubkey).await {
-            Ok(account) => Ok(account),
-            Err(e) => {
-                let kora_error = e.into();
-                match kora_error {
-                    KoraError::AccountNotFound(_) => {
-                        Err(KoraError::AccountNotFound(pubkey.to_string()))
-                    }
-                    other_error => Err(other_error),
-                }
-            }
-        }
+        rpc_client.get_account(pubkey).await.map_err(|e| match KoraError::from(e) {
+            KoraError::AccountNotFound(_) => KoraError::AccountNotFound(pubkey.to_string()),
+            other_error => other_error,
+        })
     }
 
-    /// Get data from cache
     async fn get_from_cache(pool: &Pool, key: &str) -> Result<Option<CachedAccount>, KoraError> {
         let mut conn = Self::get_connection(pool).await?;
 
@@ -170,7 +158,6 @@ impl CacheUtil {
         }
     }
 
-    /// Get account from RPC and cache it
     async fn get_account_from_rpc_and_cache(
         rpc_client: &RpcClient,
         pubkey: &Pubkey,
@@ -191,7 +178,6 @@ impl CacheUtil {
         Ok(account)
     }
 
-    /// Set data in cache with TTL
     async fn set_in_cache(
         pool: &Pool,
         key: &str,
@@ -217,38 +203,25 @@ impl CacheUtil {
         Ok(())
     }
 
-    /// Check if cache is enabled and available
     fn is_cache_enabled(config: &Config) -> bool {
         config.kora.cache.enabled && config.kora.cache.resolved_url().is_some()
     }
 
-    /// Get account from cache with optional force refresh
+    fn pool(config: &Config) -> Option<&'static Pool> {
+        if !Self::is_cache_enabled(config) {
+            return None;
+        }
+        CACHE_POOL.get()?.as_ref()
+    }
+
     pub async fn get_account(
         config: &Config,
         rpc_client: &RpcClient,
         pubkey: &Pubkey,
         force_refresh: bool,
     ) -> Result<Account, KoraError> {
-        // If cache is disabled or force refresh is requested, go directly to RPC
-        if !CacheUtil::is_cache_enabled(config) {
+        let Some(pool) = Self::pool(config) else {
             return Self::get_account_from_rpc(rpc_client, pubkey).await;
-        }
-
-        // Get cache pool - if not initialized, fallback to RPC
-        let pool = match CACHE_POOL.get() {
-            Some(pool) => pool,
-            None => {
-                // Cache not initialized, fallback to RPC
-                return Self::get_account_from_rpc(rpc_client, pubkey).await;
-            }
-        };
-
-        let pool = match pool {
-            Some(pool) => pool,
-            None => {
-                // Cache disabled, fallback to RPC
-                return Self::get_account_from_rpc(rpc_client, pubkey).await;
-            }
         };
 
         if force_refresh {
@@ -263,18 +236,15 @@ impl CacheUtil {
 
         let cache_key = Self::get_account_key(pubkey);
 
-        // Try to get from cache first
         if let Ok(Some(cached_account)) = Self::get_from_cache(pool, &cache_key).await {
             let current_time = chrono::Utc::now().timestamp();
             let cache_age = current_time - cached_account.cached_at;
 
-            // Check if cache is still valid
             if cache_age < config.kora.cache.account_ttl as i64 {
                 return Ok(cached_account.account);
             }
         }
 
-        // Cache miss or expired, fetch from RPC
         let account = Self::get_account_from_rpc_and_cache(
             rpc_client,
             pubkey,
@@ -294,27 +264,18 @@ impl CacheUtil {
         config: &Config,
         rpc_client: &RpcClient,
     ) -> Result<Hash, KoraError> {
-        // If cache is disabled, fetch directly from RPC
-        if !CacheUtil::is_cache_enabled(config) {
+        let Some(pool) = Self::pool(config) else {
             return Self::fetch_blockhash_from_rpc(rpc_client).await;
-        }
-
-        // Get cache pool - if not initialized, fallback to RPC
-        let pool = match CACHE_POOL.get() {
-            Some(Some(pool)) => pool,
-            _ => return Self::fetch_blockhash_from_rpc(rpc_client).await,
         };
 
-        // Try to get from cache first
         match Self::get_blockhash_from_cache(pool).await {
             Ok(Some(hash)) => return Ok(hash),
-            Ok(None) => { /* cache miss, fetch from RPC */ }
+            Ok(None) => {}
             Err(e) => {
                 log::warn!("Failed to get blockhash from cache, falling back to RPC: {e}");
             }
         }
 
-        // Cache miss or error — fetch from RPC and cache it
         let hash = Self::fetch_blockhash_from_rpc(rpc_client).await?;
 
         if let Err(e) = Self::set_blockhash_in_cache(pool, &hash).await {
@@ -325,7 +286,6 @@ impl CacheUtil {
         Ok(hash)
     }
 
-    /// Fetch the latest blockhash directly from the Solana RPC.
     async fn fetch_blockhash_from_rpc(rpc_client: &RpcClient) -> Result<Hash, KoraError> {
         let (blockhash, _) = rpc_client
             .get_latest_blockhash_with_commitment(CommitmentConfig::confirmed())
@@ -334,7 +294,6 @@ impl CacheUtil {
         Ok(blockhash)
     }
 
-    /// Try to read a cached blockhash from Redis.
     async fn get_blockhash_from_cache(pool: &Pool) -> Result<Option<Hash>, KoraError> {
         let mut conn = Self::get_connection(pool).await?;
 
@@ -356,7 +315,6 @@ impl CacheUtil {
         }
     }
 
-    /// Store a blockhash in Redis with TTL.
     async fn set_blockhash_in_cache(pool: &Pool, hash: &Hash) -> Result<(), KoraError> {
         let mut conn = Self::get_connection(pool).await?;
 
@@ -469,7 +427,6 @@ impl CacheUtil {
         Ok((hits, misses))
     }
 
-    /// Write fetched prices back to Redis with `price_ttl`.
     async fn set_prices_in_cache(
         pool: &Pool,
         source: &PriceSource,
@@ -556,21 +513,11 @@ impl CacheUtil {
 
         // If cache is disabled globally, pool not initialized, or price caching
         // is opted out via `price_ttl = 0`, go straight to the oracle.
-        if !Self::is_cache_enabled(config) || config.kora.cache.price_ttl == 0 {
+        let Some(pool) = Self::pool(config).filter(|_| config.kora.cache.price_ttl != 0) else {
             return Self::get_price_oracle_singleton(config)
                 .await?
                 .get_token_prices(mint_addresses)
                 .await;
-        }
-
-        let pool = match CACHE_POOL.get() {
-            Some(Some(pool)) => pool,
-            _ => {
-                return Self::get_price_oracle_singleton(config)
-                    .await?
-                    .get_token_prices(mint_addresses)
-                    .await;
-            }
         };
 
         let min_fresh_block_id = Self::min_fresh_price_block_id(rpc_client, config).await?;
@@ -676,19 +623,14 @@ impl CacheUtil {
         rpc_client: &RpcClient,
         pubkeys: &[Pubkey],
     ) -> Result<Vec<Account>, KoraError> {
-        match rpc_client.get_multiple_accounts(pubkeys).await {
-            Ok(accounts_opt) => {
-                let mut result = Vec::with_capacity(pubkeys.len());
-                for (i, acc_opt) in accounts_opt.into_iter().enumerate() {
-                    match acc_opt {
-                        Some(acc) => result.push(acc),
-                        None => return Err(KoraError::AccountNotFound(pubkeys[i].to_string())),
-                    }
-                }
-                Ok(result)
-            }
-            Err(e) => Err(e.into()),
-        }
+        let accounts_opt = rpc_client.get_multiple_accounts(pubkeys).await?;
+        accounts_opt
+            .into_iter()
+            .zip(pubkeys)
+            .map(|(acc_opt, pubkey)| {
+                acc_opt.ok_or_else(|| KoraError::AccountNotFound(pubkey.to_string()))
+            })
+            .collect()
     }
 
     /// Get multiple accounts, using Redis cache when available.
@@ -701,14 +643,8 @@ impl CacheUtil {
             return Ok(vec![]);
         }
 
-        // If cache is disabled, go directly to RPC
-        if !CacheUtil::is_cache_enabled(config) {
+        let Some(pool) = Self::pool(config) else {
             return Self::get_multiple_accounts_from_rpc(rpc_client, pubkeys).await;
-        }
-
-        let pool = match CACHE_POOL.get() {
-            Some(Some(pool)) => pool,
-            _ => return Self::get_multiple_accounts_from_rpc(rpc_client, pubkeys).await,
         };
 
         let mut conn = match Self::get_connection(pool).await {
@@ -762,10 +698,7 @@ impl CacheUtil {
 
         if !misses.is_empty() {
             let miss_pubkeys: Vec<Pubkey> = misses.iter().map(|(_, pk)| *pk).collect();
-            let accounts_opt = match rpc_client.get_multiple_accounts(&miss_pubkeys).await {
-                Ok(a) => a,
-                Err(e) => return Err(e.into()),
-            };
+            let accounts_opt = rpc_client.get_multiple_accounts(&miss_pubkeys).await?;
 
             let mut pipe = redis::pipe();
             let mut has_pipe_ops = false;
@@ -846,10 +779,9 @@ mod tests {
     async fn test_is_cache_enabled_no_url() {
         let _m = ConfigMockBuilder::new()
             .with_cache_enabled(true)
-            .with_cache_url(None) // Explicitly set no URL
+            .with_cache_url(None)
             .build_and_setup();
 
-        // Without URL, cache should be disabled
         let config = get_config().unwrap();
         assert!(!CacheUtil::is_cache_enabled(&config));
     }
@@ -861,7 +793,6 @@ mod tests {
             .with_cache_url(Some("redis://localhost:6379".to_string()))
             .build_and_setup();
 
-        // Give time for config to be set up
         let config = get_config().unwrap();
         assert!(CacheUtil::is_cache_enabled(&config));
     }
@@ -992,7 +923,6 @@ mod tests {
 
         let rpc_client = RpcMockBuilder::new().with_account_info(&expected_account).build();
 
-        // force_refresh = true should always go to RPC
         let result = CacheUtil::get_account(&config, &rpc_client, &pubkey, true).await;
 
         assert!(result.is_ok());
@@ -1032,7 +962,6 @@ mod tests {
         let pubkey1 = Pubkey::new_unique();
         let pubkeys = vec![pubkey1];
 
-        // Rpc returns None for the missing account
         let rpc_client = RpcMockBuilder::new().with_multiple_accounts_info(vec![None]).build();
 
         let result = CacheUtil::get_multiple_accounts(&config, &rpc_client, &pubkeys).await;

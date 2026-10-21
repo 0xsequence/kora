@@ -6,7 +6,7 @@ use crate::error::KoraError;
 #[cfg(feature = "docs")]
 use utoipa::{
     openapi::{RefOr, Schema},
-    ToSchema,
+    PartialSchema,
 };
 
 #[allow(deprecated)]
@@ -46,6 +46,14 @@ pub struct OpenApiSpec {
     pub response: RefOr<Schema>,
 }
 
+fn log_response<T: std::fmt::Debug>(
+    label: &str,
+    result: Result<T, KoraError>,
+) -> Result<T, KoraError> {
+    info!("{label} response: {result:?}");
+    result
+}
+
 impl KoraRpc {
     pub fn new(rpc_client: Arc<RpcClient>) -> Self {
         Self { rpc_client }
@@ -57,9 +65,7 @@ impl KoraRpc {
 
     pub async fn liveness(&self) -> Result<(), KoraError> {
         info!("Liveness request received");
-        let result = Ok(());
-        info!("Liveness response: {result:?}");
-        result
+        log_response("Liveness", Ok(()))
     }
 
     pub async fn estimate_transaction_fee(
@@ -67,9 +73,10 @@ impl KoraRpc {
         request: EstimateTransactionFeeRequest,
     ) -> Result<EstimateTransactionFeeResponse, KoraError> {
         info!("Estimate transaction fee request: {request:?}");
-        let result = estimate_transaction_fee(&self.rpc_client, request).await;
-        info!("Estimate transaction fee response: {result:?}");
-        result
+        log_response(
+            "Estimate transaction fee",
+            estimate_transaction_fee(&self.rpc_client, request).await,
+        )
     }
 
     pub async fn estimate_bundle_fee(
@@ -77,23 +84,17 @@ impl KoraRpc {
         request: EstimateBundleFeeRequest,
     ) -> Result<EstimateBundleFeeResponse, KoraError> {
         info!("Estimate bundle fee request: {request:?}");
-        let result = estimate_bundle_fee(&self.rpc_client, request).await;
-        info!("Estimate bundle fee response: {result:?}");
-        result
+        log_response("Estimate bundle fee", estimate_bundle_fee(&self.rpc_client, request).await)
     }
 
     pub async fn get_supported_tokens(&self) -> Result<GetSupportedTokensResponse, KoraError> {
         info!("Get supported tokens request received");
-        let result = get_supported_tokens().await;
-        info!("Get supported tokens response: {result:?}");
-        result
+        log_response("Get supported tokens", get_supported_tokens().await)
     }
 
     pub async fn get_payer_signer(&self) -> Result<GetPayerSignerResponse, KoraError> {
         info!("Get payer signer request received");
-        let result = get_payer_signer().await;
-        info!("Get payer signer response: {result:?}");
-        result
+        log_response("Get payer signer", get_payer_signer().await)
     }
 
     pub async fn sign_transaction(
@@ -101,9 +102,7 @@ impl KoraRpc {
         request: SignTransactionRequest,
     ) -> Result<SignTransactionResponse, KoraError> {
         info!("Sign transaction request: {request:?}");
-        let result = sign_transaction(&self.rpc_client, request).await;
-        info!("Sign transaction response: {result:?}");
-        result
+        log_response("Sign transaction", sign_transaction(&self.rpc_client, request).await)
     }
 
     pub async fn sign_and_send_transaction(
@@ -111,9 +110,10 @@ impl KoraRpc {
         request: SignAndSendTransactionRequest,
     ) -> Result<SignAndSendTransactionResponse, KoraError> {
         info!("Sign and send transaction request: {request:?}");
-        let result = sign_and_send_transaction(&self.rpc_client, request).await;
-        info!("Sign and send transaction response: {result:?}");
-        result
+        log_response(
+            "Sign and send transaction",
+            sign_and_send_transaction(&self.rpc_client, request).await,
+        )
     }
 
     #[deprecated(since = "2.2.0", note = "Use getPaymentInstruction instead for fee payment flows")]
@@ -124,29 +124,22 @@ impl KoraRpc {
         info!("Transfer transaction request: {request:?}");
         #[allow(deprecated)]
         let result = transfer_transaction(&self.rpc_client, request).await;
-        info!("Transfer transaction response: {result:?}");
-        result
+        log_response("Transfer transaction", result)
     }
 
     pub async fn get_blockhash(&self) -> Result<GetBlockhashResponse, KoraError> {
         info!("Get blockhash request received");
-        let result = get_blockhash(&self.rpc_client).await;
-        info!("Get blockhash response: {result:?}");
-        result
+        log_response("Get blockhash", get_blockhash(&self.rpc_client).await)
     }
 
     pub async fn get_config(&self) -> Result<GetConfigResponse, KoraError> {
         info!("Get config request received");
-        let result = get_config().await;
-        info!("Get config response: {result:?}");
-        result
+        log_response("Get config", get_config().await)
     }
 
     pub async fn get_version(&self) -> Result<GetVersionResponse, KoraError> {
         info!("Get version request received");
-        let result = get_version().await;
-        info!("Get version response: {result:?}");
-        result
+        log_response("Get version", get_version().await)
     }
 
     pub async fn sign_bundle(
@@ -154,9 +147,7 @@ impl KoraRpc {
         request: SignBundleRequest,
     ) -> Result<SignBundleResponse, KoraError> {
         info!("Sign bundle request: {request:?}");
-        let result = sign_bundle(&self.rpc_client, request).await;
-        info!("Sign bundle response: {result:?}");
-        result
+        log_response("Sign bundle", sign_bundle(&self.rpc_client, request).await)
     }
 
     pub async fn sign_and_send_bundle(
@@ -164,9 +155,7 @@ impl KoraRpc {
         request: SignAndSendBundleRequest,
     ) -> Result<SignAndSendBundleResponse, KoraError> {
         info!("Sign and send bundle request: {request:?}");
-        let result = sign_and_send_bundle(&self.rpc_client, request).await;
-        info!("Sign and send bundle response: {result:?}");
-        result
+        log_response("Sign and send bundle", sign_and_send_bundle(&self.rpc_client, request).await)
     }
 
     #[cfg(feature = "docs")]
@@ -174,63 +163,63 @@ impl KoraRpc {
         vec![
             OpenApiSpec {
                 name: "estimateTransactionFee".to_string(),
-                request: Some(EstimateTransactionFeeRequest::schema().1),
-                response: EstimateTransactionFeeResponse::schema().1,
+                request: Some(EstimateTransactionFeeRequest::schema()),
+                response: EstimateTransactionFeeResponse::schema(),
             },
             OpenApiSpec {
                 name: "estimateBundleFee".to_string(),
-                request: Some(EstimateBundleFeeRequest::schema().1),
-                response: EstimateBundleFeeResponse::schema().1,
+                request: Some(EstimateBundleFeeRequest::schema()),
+                response: EstimateBundleFeeResponse::schema(),
             },
             OpenApiSpec {
                 name: "getBlockhash".to_string(),
                 request: None,
-                response: GetBlockhashResponse::schema().1,
+                response: GetBlockhashResponse::schema(),
             },
             OpenApiSpec {
                 name: "getConfig".to_string(),
                 request: None,
-                response: GetConfigResponse::schema().1,
+                response: GetConfigResponse::schema(),
             },
             OpenApiSpec {
                 name: "getSupportedTokens".to_string(),
                 request: None,
-                response: GetSupportedTokensResponse::schema().1,
+                response: GetSupportedTokensResponse::schema(),
             },
             OpenApiSpec {
                 name: "getPayerSigner".to_string(),
                 request: None,
-                response: GetPayerSignerResponse::schema().1,
+                response: GetPayerSignerResponse::schema(),
             },
             OpenApiSpec {
                 name: "signTransaction".to_string(),
-                request: Some(SignTransactionRequest::schema().1),
-                response: SignTransactionResponse::schema().1,
+                request: Some(SignTransactionRequest::schema()),
+                response: SignTransactionResponse::schema(),
             },
             OpenApiSpec {
                 name: "signAndSendTransaction".to_string(),
-                request: Some(SignAndSendTransactionRequest::schema().1),
-                response: SignAndSendTransactionResponse::schema().1,
+                request: Some(SignAndSendTransactionRequest::schema()),
+                response: SignAndSendTransactionResponse::schema(),
             },
             OpenApiSpec {
                 name: "transferTransaction".to_string(),
-                request: Some(TransferTransactionRequest::schema().1),
-                response: TransferTransactionResponse::schema().1,
+                request: Some(TransferTransactionRequest::schema()),
+                response: TransferTransactionResponse::schema(),
             },
             OpenApiSpec {
                 name: "getVersion".to_string(),
                 request: None,
-                response: GetVersionResponse::schema().1,
+                response: GetVersionResponse::schema(),
             },
             OpenApiSpec {
                 name: "signBundle".to_string(),
-                request: Some(SignBundleRequest::schema().1),
-                response: SignBundleResponse::schema().1,
+                request: Some(SignBundleRequest::schema()),
+                response: SignBundleResponse::schema(),
             },
             OpenApiSpec {
                 name: "signAndSendBundle".to_string(),
-                request: Some(SignAndSendBundleRequest::schema().1),
-                response: SignAndSendBundleResponse::schema().1,
+                request: Some(SignAndSendBundleRequest::schema()),
+                response: SignAndSendBundleResponse::schema(),
             },
         ]
     }
@@ -256,7 +245,6 @@ mod tests {
     async fn test_liveness() {
         let kora_rpc = create_test_kora_rpc();
 
-        // Test liveness endpoint
         let result = kora_rpc.liveness().await;
         assert!(result.is_ok());
     }
@@ -274,26 +262,21 @@ mod tests {
 
     #[tokio::test]
     async fn test_method_delegation_with_mocks() {
-        // Setup test environment with both config and signer
         let config = ConfigMockBuilder::new().build();
         update_config(config).expect("Failed to update config");
-        let _ = setup_or_get_test_signer(); // This initializes the signer pool
+        let _ = setup_or_get_test_signer();
 
         let kora_rpc = create_test_kora_rpc();
 
-        // Test liveness - should always succeed
         let liveness_result = kora_rpc.liveness().await;
         assert!(liveness_result.is_ok(), "Liveness should always succeed");
 
-        // Test get_config - should work with mock config and signer pool
         let config_result = kora_rpc.get_config().await;
         assert!(config_result.is_ok(), "Get config failed: {:?}", config_result.err());
 
-        // Test get_supported_tokens - should work with mock config
         let tokens_result = kora_rpc.get_supported_tokens().await;
         assert!(tokens_result.is_ok(), "Get supported tokens failed: {:?}", tokens_result.err());
 
-        // Test get_payer_signer - should work with mock signer pool
         let signer_result = kora_rpc.get_payer_signer().await;
         assert!(signer_result.is_ok(), "Get payer signer failed: {:?}", signer_result.err());
     }

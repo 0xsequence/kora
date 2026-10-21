@@ -38,7 +38,7 @@ impl PluginExecutionContext {
 trait TransactionPlugin: Send + Sync {
     async fn validate(
         &self,
-        transaction: &mut VersionedTransactionResolved,
+        transaction: &VersionedTransactionResolved,
         _config: &Config,
         _rpc_client: &RpcClient,
         fee_payer: &Pubkey,
@@ -92,16 +92,8 @@ impl TransactionPluginRunner {
     pub fn validate_config(config: &Config) -> (Vec<String>, Vec<String>) {
         let mut errors = Vec::new();
         let mut warnings = Vec::new();
-        let mut seen = HashSet::new();
 
-        for plugin_type in &config.kora.plugins.enabled {
-            if !seen.insert(plugin_type.clone()) {
-                continue;
-            }
-            let plugin: Box<dyn TransactionPlugin> = match plugin_type {
-                TransactionPluginType::GasSwap => Box::new(GasSwapPlugin),
-                TransactionPluginType::DeployAuthority => Box::new(DeployAuthorityPlugin),
-            };
+        for plugin in &Self::from_config(config).plugins {
             let (e, w) = plugin.validate_config(config);
             errors.extend(e);
             warnings.extend(w);
@@ -112,7 +104,7 @@ impl TransactionPluginRunner {
 
     pub async fn run(
         &self,
-        transaction: &mut VersionedTransactionResolved,
+        transaction: &VersionedTransactionResolved,
         config: &Config,
         rpc_client: &RpcClient,
         fee_payer: &Pubkey,

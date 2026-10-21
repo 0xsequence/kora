@@ -21,6 +21,13 @@ use std::str::FromStr;
 
 const LIGHTHOUSE_PROGRAM_ID: &str = "L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95";
 
+/// Kora builds the assertion from a balance it reads at signing time, asserting
+/// the fee payer keeps at least `balance - estimated_fee`. Another test paying a
+/// fee from the same fee payer in between makes that assertion fail, so the
+/// tests that only read state share this lock while the two that send take it
+/// exclusively.
+static FEE_PAYER_SOL: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
+
 fn verify_lighthouse_assertion_added(
     transaction: &solana_sdk::transaction::VersionedTransaction,
 ) -> bool {
@@ -63,7 +70,8 @@ fn resign_transaction(
 
 #[tokio::test]
 async fn test_sign_transaction_with_lighthouse_legacy() {
-    let ctx = TestContext::new().await.expect("Failed to create test context");
+    let ctx = crate::ctx().await;
+    let _fee_payer_sol = FEE_PAYER_SOL.read().await;
     let rpc_client = ctx.rpc_client();
 
     let fee_payer = FeePayerTestHelper::get_fee_payer_pubkey();
@@ -106,6 +114,11 @@ async fn test_sign_transaction_with_lighthouse_legacy() {
         original_ix_count + 1,
         "Expected one additional instruction (lighthouse assertion)"
     );
+    assert_eq!(
+        response["lighthouse_assertion_added"].as_bool(),
+        Some(true),
+        "The response must report that the assertion was appended"
+    );
 
     assert!(
         verify_lighthouse_assertion_added(&signed_tx),
@@ -124,7 +137,8 @@ async fn test_sign_transaction_with_lighthouse_legacy() {
 
 #[tokio::test]
 async fn test_sign_transaction_with_lighthouse_v0() {
-    let ctx = TestContext::new().await.expect("Failed to create test context");
+    let ctx = crate::ctx().await;
+    let _fee_payer_sol = FEE_PAYER_SOL.read().await;
     let rpc_client = ctx.rpc_client();
 
     let fee_payer = FeePayerTestHelper::get_fee_payer_pubkey();
@@ -192,13 +206,9 @@ async fn test_sign_transaction_with_lighthouse_v0() {
     );
 }
 
-// **************************************************************************************
-// Bundle Tests
-// **************************************************************************************
-
 #[tokio::test]
 async fn test_sign_bundle_with_lighthouse() {
-    let ctx = TestContext::new().await.expect("Failed to create test context");
+    let ctx = crate::ctx().await;
 
     let fee_payer = FeePayerTestHelper::get_fee_payer_pubkey();
     let sender = SenderTestHelper::get_test_sender_keypair();
@@ -264,14 +274,10 @@ async fn test_sign_bundle_with_lighthouse() {
     }
 }
 
-// **************************************************************************************
-// End-to-End Tests (Full Flow with Client Re-signing)
-// **************************************************************************************
-
-/// End-to-end test: client signs → Kora adds lighthouse → client re-signs → simulate succeeds
 #[tokio::test]
 async fn test_lighthouse_end_to_end_with_client_resign() {
-    let ctx = TestContext::new().await.expect("Failed to create test context");
+    let ctx = crate::ctx().await;
+    let _fee_payer_sol = FEE_PAYER_SOL.read().await;
     let rpc_client = ctx.rpc_client();
 
     let fee_payer = FeePayerTestHelper::get_fee_payer_pubkey();
@@ -279,7 +285,6 @@ async fn test_lighthouse_end_to_end_with_client_resign() {
     let recipient = RecipientTestHelper::get_recipient_pubkey();
     let token_mint = USDCMintTestHelper::get_test_usdc_mint_pubkey();
 
-    // Step 1: Build transaction with sender signature
     let base64_transaction = ctx
         .transaction_builder()
         .with_fee_payer(fee_payer)
@@ -299,7 +304,6 @@ async fn test_lighthouse_end_to_end_with_client_resign() {
         .expect("Failed to decode original transaction");
     let original_ix_count = original_tx.message.instructions().len();
 
-    // Step 2: Call signTransaction (Kora adds lighthouse and signs as fee payer)
     let response: serde_json::Value = ctx
         .rpc_call("signTransaction", rpc_params![base64_transaction])
         .await
@@ -311,21 +315,23 @@ async fn test_lighthouse_end_to_end_with_client_resign() {
     let mut signed_tx = TransactionUtil::decode_b64_transaction(signed_tx_b64)
         .expect("Failed to decode signed transaction");
 
-    // Verify lighthouse assertion was added
     assert_eq!(
         signed_tx.message.instructions().len(),
         original_ix_count + 1,
         "Expected one additional instruction (lighthouse assertion)"
+    );
+    assert_eq!(
+        response["lighthouse_assertion_added"].as_bool(),
+        Some(true),
+        "The response must report that the assertion was appended"
     );
     assert!(
         verify_lighthouse_assertion_added(&signed_tx),
         "Last instruction should be lighthouse program"
     );
 
-    // Step 3: Client re-signs (required because message changed)
     resign_transaction(&mut signed_tx, &sender).expect("Failed to re-sign transaction");
 
-    // Step 4: Simulate with sig_verify=true to verify both signatures are valid
     let sim_result = rpc_client
         .simulate_transaction_with_config(
             &signed_tx,
@@ -348,7 +354,8 @@ async fn test_lighthouse_end_to_end_with_client_resign() {
 /// V0 version of the end-to-end test
 #[tokio::test]
 async fn test_lighthouse_end_to_end_v0_with_client_resign() {
-    let ctx = TestContext::new().await.expect("Failed to create test context");
+    let ctx = crate::ctx().await;
+    let _fee_payer_sol = FEE_PAYER_SOL.read().await;
     let rpc_client = ctx.rpc_client();
 
     let fee_payer = FeePayerTestHelper::get_fee_payer_pubkey();
@@ -356,7 +363,6 @@ async fn test_lighthouse_end_to_end_v0_with_client_resign() {
     let recipient = RecipientTestHelper::get_recipient_pubkey();
     let token_mint = USDCMintTestHelper::get_test_usdc_mint_pubkey();
 
-    // Step 1: Build V0 transaction with sender signature
     let base64_transaction = ctx
         .v0_transaction_builder()
         .with_fee_payer(fee_payer)
@@ -383,7 +389,6 @@ async fn test_lighthouse_end_to_end_v0_with_client_resign() {
         .expect("Failed to decode original V0 transaction");
     let original_ix_count = original_tx.message.instructions().len();
 
-    // Step 2: Call signTransaction (Kora adds lighthouse and signs as fee payer)
     let response: serde_json::Value = ctx
         .rpc_call("signTransaction", rpc_params![base64_transaction])
         .await
@@ -395,7 +400,6 @@ async fn test_lighthouse_end_to_end_v0_with_client_resign() {
     let mut signed_tx = TransactionUtil::decode_b64_transaction(signed_tx_b64)
         .expect("Failed to decode signed V0 transaction");
 
-    // Verify lighthouse assertion was added
     assert_eq!(
         signed_tx.message.instructions().len(),
         original_ix_count + 1,
@@ -406,10 +410,8 @@ async fn test_lighthouse_end_to_end_v0_with_client_resign() {
         "Last instruction should be lighthouse program for V0"
     );
 
-    // Step 3: Client re-signs (required because message changed)
     resign_transaction(&mut signed_tx, &sender).expect("Failed to re-sign V0 transaction");
 
-    // Step 4: Simulate with sig_verify=true to verify both signatures are valid
     let sim_result = rpc_client
         .simulate_transaction_with_config(
             &signed_tx,
@@ -437,11 +439,11 @@ async fn test_lighthouse_end_to_end_v0_with_client_resign() {
 /// (because modifying the message would invalidate existing client signatures)
 #[tokio::test]
 async fn test_sign_and_send_transaction_no_lighthouse_assertion() {
-    let ctx = TestContext::new().await.expect("Failed to create test context");
+    let ctx = crate::ctx().await;
+    let _fee_payer_sol = FEE_PAYER_SOL.write().await;
 
     let fee_payer = FeePayerTestHelper::get_fee_payer_pubkey();
     let sender = SenderTestHelper::get_test_sender_keypair();
-    let recipient = RecipientTestHelper::get_recipient_pubkey();
     let token_mint = USDCMintTestHelper::get_test_usdc_mint_pubkey();
 
     let base64_transaction = ctx
@@ -454,7 +456,7 @@ async fn test_sign_and_send_transaction_no_lighthouse_assertion() {
             &fee_payer,
             tests::common::helpers::get_fee_for_default_transaction_in_usdc(),
         )
-        .with_transfer(&sender.pubkey(), &recipient, 10)
+        .with_unique_transfer(&sender.pubkey())
         .build()
         .await
         .expect("Failed to create transaction");
@@ -487,20 +489,19 @@ async fn test_sign_and_send_transaction_no_lighthouse_assertion() {
     );
 }
 
-/// Verify that signAndSendBundle does NOT add lighthouse assertion
 #[tokio::test]
 async fn test_sign_and_send_bundle_no_lighthouse_assertion() {
-    let ctx = TestContext::new().await.expect("Failed to create test context");
+    let ctx = crate::ctx().await;
+    let _fee_payer_sol = FEE_PAYER_SOL.write().await;
 
     let fee_payer = FeePayerTestHelper::get_fee_payer_pubkey();
     let sender = SenderTestHelper::get_test_sender_keypair();
-    let recipient = RecipientTestHelper::get_recipient_pubkey();
     let token_mint = USDCMintTestHelper::get_test_usdc_mint_pubkey();
 
     let mut transactions = Vec::new();
     let mut original_ix_counts = Vec::new();
 
-    for i in 0..2 {
+    for _ in 0..2 {
         let tx = ctx
             .transaction_builder()
             .with_fee_payer(fee_payer)
@@ -511,7 +512,7 @@ async fn test_sign_and_send_bundle_no_lighthouse_assertion() {
                 &fee_payer,
                 tests::common::helpers::get_fee_for_default_transaction_in_usdc(),
             )
-            .with_transfer(&sender.pubkey(), &recipient, 10 + i)
+            .with_unique_transfer(&sender.pubkey())
             .build()
             .await
             .expect("Failed to create transaction");

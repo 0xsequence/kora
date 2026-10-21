@@ -1,5 +1,5 @@
 use crate::{
-    config::AuthConfig,
+    config::{classify_cors_origins, CorsOriginsClassification},
     constant::{X_API_KEY, X_HMAC_SIGNATURE, X_RECAPTCHA_TOKEN, X_TIMESTAMP},
     metrics::run_metrics_server_if_required,
     rpc_server::{
@@ -19,15 +19,15 @@ use crate::state::get_config;
 
 #[cfg(test)]
 use crate::tests::config_mock::mock_state::get_config;
-use http::{header, Method};
+use http::{header, HeaderValue, Method};
 use jsonrpsee::{
     server::{middleware::proxy_get_request::ProxyGetRequestLayer, ServerBuilder, ServerHandle},
     RpcModule,
 };
-use std::{net::SocketAddr, time::Duration};
+use std::{iter::empty, net::SocketAddr, time::Duration};
 use tokio::task::JoinHandle;
 use tower::limit::RateLimitLayer;
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 pub struct ServerHandles {
     pub rpc_handle: ServerHandle,
@@ -104,24 +104,48 @@ async fn wait_for_rpc_stop(rpc_handle: ServerHandle, port: u16) {
     }
 }
 
-// We'll always prioritize the environment variable over the config value
-fn get_value_by_priority(env_var: &str, config_value: Option<String>) -> Option<String> {
-    AuthConfig::resolve_secret(env_var, config_value.as_deref())
+fn build_allow_origin(origins: &[String]) -> AllowOrigin {
+    match classify_cors_origins(origins) {
+        CorsOriginsClassification::Empty => {
+            log::warn!("cors_allow_origins is empty. All cross-origin requests will be blocked.");
+            AllowOrigin::list(empty::<HeaderValue>())
+        }
+        CorsOriginsClassification::Wildcard { has_redundant } => {
+            if has_redundant {
+                log::warn!("cors_allow_origins contains '*' alongside specific origin(s). The specific origin(s) are redundant and will be silently ignored.");
+            }
+            AllowOrigin::any()
+        }
+        CorsOriginsClassification::AllInvalid => {
+            log::warn!("cors_allow_origins contains no valid origin(s) (must be e.g., 'https://your-app.com'). All cross-origin requests will be blocked.");
+            AllowOrigin::list(empty::<HeaderValue>())
+        }
+        CorsOriginsClassification::ValidWithSomeInvalid { valid_origins, invalid_origins } => {
+            for o in invalid_origins {
+                log::warn!("Invalid CORS origin '{}': Must be a valid web origin (e.g., 'https://your-app.com').", o);
+            }
+            AllowOrigin::list(valid_origins)
+        }
+        CorsOriginsClassification::AllValid { valid_origins } => AllowOrigin::list(valid_origins),
+    }
 }
 
 pub async fn run_rpc_server(rpc: KoraRpc, port: u16) -> Result<ServerHandles, anyhow::Error> {
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     log::info!("RPC server started on {addr}, port {port}");
 
-    // Initialize usage limiter
     if let Err(e) = UsageTracker::init_usage_limiter().await {
         log::error!("Failed to initialize usage limiter: {e}");
         return Err(anyhow::anyhow!("Usage limiter initialization failed: {e}"));
     }
 
+    let config = get_config()?;
+
+    let allow_origins = build_allow_origin(&config.kora.cors_allow_origins);
+
     // Build middleware stack with tracing and CORS
     let cors = CorsLayer::new()
-        .allow_origin(tower_http::cors::Any)
+        .allow_origin(allow_origins)
         .allow_methods([Method::POST, Method::GET])
         .allow_headers([
             header::CONTENT_TYPE,
@@ -132,15 +156,11 @@ pub async fn run_rpc_server(rpc: KoraRpc, port: u16) -> Result<ServerHandles, an
         ])
         .max_age(Duration::from_secs(3600));
 
-    let config = get_config()?;
-
-    // Get the RPC client from KoraRpc to pass to metrics initialization
     let rpc_client = rpc.get_rpc_client().clone();
 
     let (metrics_handle, metrics_layers, balance_tracker_handle) =
         run_metrics_server_if_required(port, rpc_client).await?;
 
-    // Build whitelist of allowed methods from enabled_methods config
     let allowed_methods = config.kora.enabled_methods.get_enabled_method_names();
 
     let recaptcha_config = config.kora.auth.resolved_recaptcha_secret().map(|secret| {
@@ -155,29 +175,22 @@ pub async fn run_rpc_server(rpc: KoraRpc, port: u16) -> Result<ServerHandles, an
         // Add metrics handler first (before other layers) so it can intercept /metrics
         .layer(ProxyGetRequestLayer::new("/liveness", "liveness")?)
         .layer(RateLimitLayer::new(config.kora.rate_limit, Duration::from_secs(1)))
-        // Add metrics handler layer for Prometheus metrics
         .option_layer(
             metrics_layers.as_ref().and_then(|layers| layers.metrics_handler_layer.clone()),
         )
         .layer(cors)
-        // Method validation layer - to fail fast
         .layer(MethodValidationLayer::new(allowed_methods.clone()))
-        // Add metrics collection layer
         .option_layer(metrics_layers.as_ref().and_then(|layers| layers.http_metrics_layer.clone()))
-        // Add authentication layer for API key if configured
+        .option_layer(config.kora.auth.resolved_api_keys().map(ApiKeyAuthLayer::new))
         .option_layer(
-            get_value_by_priority("KORA_API_KEY", config.kora.auth.api_key.clone())
-                .map(ApiKeyAuthLayer::new),
-        )
-        // Add authentication layer for HMAC if configured
-        .option_layer(
-            get_value_by_priority("KORA_HMAC_SECRET", config.kora.auth.hmac_secret.clone())
+            config
+                .kora
+                .auth
+                .resolved_hmac_secret()
                 .map(|secret| HmacAuthLayer::new(secret, config.kora.auth.max_timestamp_age)),
         )
-        // Add reCAPTCHA verification layer if configured
         .option_layer(recaptcha_config.map(RecaptchaLayer::new));
 
-    // Configure and build the server with HTTP support
     let server = ServerBuilder::default()
         .max_request_body_size(config.kora.max_request_body_size as u32)
         .set_middleware(middleware)
@@ -187,7 +200,6 @@ pub async fn run_rpc_server(rpc: KoraRpc, port: u16) -> Result<ServerHandles, an
 
     let rpc_module = build_rpc_module(rpc)?;
 
-    // Start the RPC server
     let rpc_handle = server
         .start(rpc_module)
         .map_err(|e| anyhow::anyhow!("Failed to start RPC server: {}", e))?;
@@ -197,28 +209,28 @@ pub async fn run_rpc_server(rpc: KoraRpc, port: u16) -> Result<ServerHandles, an
 
 macro_rules! register_method_if_enabled {
     // For methods without parameters
-    ($module:expr, $enabled_methods:expr, $field:ident, $method_name:expr, $rpc_method:ident) => {
-        if $enabled_methods.$field {
+    ($module:expr, $enabled_methods:expr, $method:ident, $method_name:expr) => {
+        if $enabled_methods.$method {
             let _ = $module.register_async_method(
                 $method_name,
                 |_rpc_params, rpc_context| async move {
                     let rpc = rpc_context.as_ref();
-                    rpc.$rpc_method().await.map_err(Into::into)
+                    rpc.$method().await.map_err(Into::into)
                 },
             );
         }
     };
 
     // For methods with parameters
-    ($module:expr, $enabled_methods:expr, $field:ident, $method_name:expr, $rpc_method:ident, with_params) => {
-        if $enabled_methods.$field {
+    ($module:expr, $enabled_methods:expr, $method:ident, $method_name:expr, with_params) => {
+        if $enabled_methods.$method {
             #[allow(deprecated)]
             let _ =
                 $module.register_async_method($method_name, |rpc_params, rpc_context| async move {
                     let rpc = rpc_context.as_ref();
                     let params = rpc_params.parse()?;
                     #[allow(deprecated)]
-                    rpc.$rpc_method(params).await.map_err(Into::into)
+                    rpc.$method(params).await.map_err(Into::into)
                 });
         }
     };
@@ -228,14 +240,13 @@ fn build_rpc_module(rpc: KoraRpc) -> Result<RpcModule<KoraRpc>, anyhow::Error> {
     let mut module = RpcModule::new(rpc.clone());
     let enabled_methods = &get_config()?.kora.enabled_methods;
 
-    register_method_if_enabled!(module, enabled_methods, liveness, "liveness", liveness);
+    register_method_if_enabled!(module, enabled_methods, liveness, "liveness");
 
     register_method_if_enabled!(
         module,
         enabled_methods,
         estimate_transaction_fee,
         "estimateTransactionFee",
-        estimate_transaction_fee,
         with_params
     );
     register_method_if_enabled!(
@@ -243,29 +254,20 @@ fn build_rpc_module(rpc: KoraRpc) -> Result<RpcModule<KoraRpc>, anyhow::Error> {
         enabled_methods,
         estimate_bundle_fee,
         "estimateBundleFee",
-        estimate_bundle_fee,
         with_params
     );
     register_method_if_enabled!(
         module,
         enabled_methods,
         get_supported_tokens,
-        "getSupportedTokens",
-        get_supported_tokens
+        "getSupportedTokens"
     );
-    register_method_if_enabled!(
-        module,
-        enabled_methods,
-        get_payer_signer,
-        "getPayerSigner",
-        get_payer_signer
-    );
+    register_method_if_enabled!(module, enabled_methods, get_payer_signer, "getPayerSigner");
     register_method_if_enabled!(
         module,
         enabled_methods,
         sign_transaction,
         "signTransaction",
-        sign_transaction,
         with_params
     );
     register_method_if_enabled!(
@@ -273,7 +275,6 @@ fn build_rpc_module(rpc: KoraRpc) -> Result<RpcModule<KoraRpc>, anyhow::Error> {
         enabled_methods,
         sign_and_send_transaction,
         "signAndSendTransaction",
-        sign_and_send_transaction,
         with_params
     );
     register_method_if_enabled!(
@@ -281,32 +282,17 @@ fn build_rpc_module(rpc: KoraRpc) -> Result<RpcModule<KoraRpc>, anyhow::Error> {
         enabled_methods,
         transfer_transaction,
         "transferTransaction",
-        transfer_transaction,
         with_params
     );
-    register_method_if_enabled!(
-        module,
-        enabled_methods,
-        get_blockhash,
-        "getBlockhash",
-        get_blockhash
-    );
-    register_method_if_enabled!(module, enabled_methods, get_config, "getConfig", get_config);
-    register_method_if_enabled!(module, enabled_methods, get_version, "getVersion", get_version);
-    register_method_if_enabled!(
-        module,
-        enabled_methods,
-        sign_bundle,
-        "signBundle",
-        sign_bundle,
-        with_params
-    );
+    register_method_if_enabled!(module, enabled_methods, get_blockhash, "getBlockhash");
+    register_method_if_enabled!(module, enabled_methods, get_config, "getConfig");
+    register_method_if_enabled!(module, enabled_methods, get_version, "getVersion");
+    register_method_if_enabled!(module, enabled_methods, sign_bundle, "signBundle", with_params);
     register_method_if_enabled!(
         module,
         enabled_methods,
         sign_and_send_bundle,
         "signAndSendBundle",
-        sign_and_send_bundle,
         with_params
     );
 
@@ -317,58 +303,81 @@ fn build_rpc_module(rpc: KoraRpc) -> Result<RpcModule<KoraRpc>, anyhow::Error> {
 mod tests {
     use super::*;
     use crate::{
-        config::EnabledMethods,
+        config::{AuthConfig, EnabledMethods, CORS_WILDCARD},
         tests::{
             common::setup_or_get_test_signer,
             config_mock::{ConfigMockBuilder, KoraConfigBuilder},
             rpc_mock::RpcMockBuilder,
         },
     };
-    use std::env;
+    use serial_test::serial;
+    use std::{env, net::TcpListener};
+
+    #[tokio::test]
+    #[serial]
+    async fn test_empty_cors_origins_does_not_panic() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let kora_config = KoraConfigBuilder::new().with_cors_allow_origins(vec![]).build();
+        let _m = ConfigMockBuilder::new().with_kora(kora_config).build_and_setup();
+        let _ = setup_or_get_test_signer();
+
+        let rpc_client = RpcMockBuilder::new().build();
+
+        // This should not panic and should start successfully
+        let result = run_rpc_server(KoraRpc::new(rpc_client), port).await;
+        match result {
+            Ok(_) => (),
+            Err(e) if e.to_string().contains("already initialized") => (),
+            Err(e) => panic!("Server failed to start: {:?}", e),
+        }
+    }
 
     #[test]
-    fn test_get_value_by_priority_env_var_takes_precedence() {
+    fn test_resolve_secret_env_var_takes_precedence() {
         let env_var_name = "TEST_ENV_VAR_PRECEDENCE_UNIQUE";
         env::set_var(env_var_name, "env_value");
 
-        let result = get_value_by_priority(env_var_name, Some("config_value".to_string()));
+        let result = AuthConfig::resolve_secret(env_var_name, Some("config_value"));
         assert_eq!(result, Some("env_value".to_string()));
 
         env::remove_var(env_var_name);
     }
 
     #[test]
-    fn test_get_value_by_priority_config_fallback() {
+    fn test_resolve_secret_config_fallback() {
         let env_var_name = "TEST_ENV_VAR_FALLBACK_UNIQUE_XYZ123";
 
-        let result = get_value_by_priority(env_var_name, Some("config_value".to_string()));
+        let result = AuthConfig::resolve_secret(env_var_name, Some("config_value"));
         assert_eq!(result, Some("config_value".to_string()));
     }
 
     #[test]
-    fn test_get_value_by_priority_none_when_both_missing() {
+    fn test_resolve_secret_none_when_both_missing() {
         let env_var_name = "TEST_ENV_VAR_MISSING_UNIQUE_ABC789";
 
-        let result = get_value_by_priority(env_var_name, None);
+        let result = AuthConfig::resolve_secret(env_var_name, None);
         assert_eq!(result, None);
     }
 
     #[test]
-    fn test_get_value_by_priority_empty_env_var_falls_back_to_config() {
+    fn test_resolve_secret_empty_env_var_falls_back_to_config() {
         let env_var_name = "TEST_ENV_VAR_EMPTY_ENV_UNIQUE_DEF456";
         env::set_var(env_var_name, "");
 
-        let result = get_value_by_priority(env_var_name, Some("config_value".to_string()));
+        let result = AuthConfig::resolve_secret(env_var_name, Some("config_value"));
         assert_eq!(result, Some("config_value".to_string()));
 
         env::remove_var(env_var_name);
     }
 
     #[test]
-    fn test_get_value_by_priority_empty_config_value_is_ignored() {
+    fn test_resolve_secret_empty_config_value_is_ignored() {
         let env_var_name = "TEST_ENV_VAR_EMPTY_CONFIG_UNIQUE_GHI789";
 
-        let result = get_value_by_priority(env_var_name, Some("".to_string()));
+        let result = AuthConfig::resolve_secret(env_var_name, Some(""));
         assert_eq!(result, None);
     }
 
@@ -387,7 +396,6 @@ mod tests {
         let result = build_rpc_module(kora_rpc);
         assert!(result.is_ok(), "Failed to build RPC module with all methods enabled");
 
-        // Verify that the module has the expected methods
         let module = result.unwrap();
         let method_names: Vec<&str> = module.method_names().collect();
         assert_eq!(method_names.len(), 10);
@@ -406,7 +414,6 @@ mod tests {
 
     #[test]
     fn test_build_rpc_module_all_methods_disabled() {
-        // Setup config with all methods disabled
         let enabled_methods = EnabledMethods {
             estimate_transaction_fee: false,
             get_supported_tokens: false,
@@ -427,11 +434,9 @@ mod tests {
         let _m = ConfigMockBuilder::new().with_kora(kora_config).build_and_setup();
         let _ = setup_or_get_test_signer();
 
-        // Create RPC module
         let rpc_client = RpcMockBuilder::new().build();
         let kora_rpc = KoraRpc::new(rpc_client);
 
-        // Build the module - should succeed even with no methods
         let result = build_rpc_module(kora_rpc);
         assert!(result.is_ok(), "Failed to build RPC module with all methods disabled");
 
@@ -440,7 +445,6 @@ mod tests {
 
     #[test]
     fn test_build_rpc_module_selective_methods() {
-        // Setup config with only some methods enabled
         let enabled_methods = EnabledMethods {
             liveness: true,
             get_config: true,
@@ -461,20 +465,92 @@ mod tests {
         let _m = ConfigMockBuilder::new().with_kora(kora_config).build_and_setup();
         let _ = setup_or_get_test_signer();
 
-        // Create RPC module
         let rpc_client = RpcMockBuilder::new().build();
         let kora_rpc = KoraRpc::new(rpc_client);
 
-        // Build the module
         let result = build_rpc_module(kora_rpc);
         assert!(result.is_ok(), "Failed to build RPC module with selective methods");
 
-        // Verify that only the expected methods are registered
         let module = result.unwrap();
         let method_names: Vec<&str> = module.method_names().collect();
         assert_eq!(method_names.len(), 3);
         assert!(method_names.contains(&"liveness"));
         assert!(method_names.contains(&"getConfig"));
         assert!(method_names.contains(&"getSupportedTokens"));
+    }
+
+    #[test]
+    fn test_malformed_origins_rejected() {
+        let origins = vec![
+            "https://your-app.com/".to_string(),
+            "https://your-app.com/path".to_string(),
+            "https://your-app.com?q=1".to_string(),
+            "https://example.com#frag".to_string(),
+            "https://example.com:badport".to_string(),
+            "https://user:pass@example.com".to_string(),
+            "https://example.com:99999".to_string(),
+        ];
+        let allow_origin = build_allow_origin(&origins);
+
+        let debug_str = format!("{:?}", allow_origin);
+        // None of these origins should be in the AllowOrigin list
+        assert!(!debug_str.contains("https://your-app.com/"));
+        assert!(!debug_str.contains("https://your-app.com/path"));
+        assert!(!debug_str.contains("https://your-app.com?q=1"));
+        assert!(!debug_str.contains("https://example.com#frag"));
+        assert!(!debug_str.contains("https://example.com:badport"));
+        assert!(!debug_str.contains("https://user:pass@example.com"));
+        assert!(!debug_str.contains("https://example.com:99999"));
+        assert!(debug_str.contains("[]") || debug_str.contains("List([])"));
+
+        // Valid ones should be accepted
+        let valid_origins = vec![
+            "https://your-app.com".to_string(),
+            "https://your-app.com:8080".to_string(),
+            "https://[::1]:8080".to_string(),
+            "https://[::1]".to_string(),
+        ];
+        let allow_origin_valid = build_allow_origin(&valid_origins);
+        let valid_debug_str = format!("{:?}", allow_origin_valid);
+        assert!(valid_debug_str.contains("https://your-app.com"));
+        assert!(valid_debug_str.contains("https://your-app.com:8080"));
+        assert!(valid_debug_str.contains("https://[::1]:8080"));
+        assert!(valid_debug_str.contains("https://[::1]"));
+    }
+
+    #[test]
+    fn test_empty_host_rejected() {
+        // These should be rejected because the host part is empty or malformed
+        let origins = vec![
+            "https://:8080".to_string(),
+            "https://[]:8080".to_string(),
+            "https://example.com:".to_string(),
+            "https://[::1]garbage".to_string(),
+            "https://[::1]garbage:8080".to_string(),
+            "https://[not-ipv6]".to_string(),
+        ];
+        let allow_origin = build_allow_origin(&origins);
+
+        let debug_str = format!("{:?}", allow_origin);
+        assert!(!debug_str.contains("https://:8080"));
+        assert!(!debug_str.contains("https://[]:8080"));
+        assert!(!debug_str.contains("https://example.com:"));
+        assert!(!debug_str.contains("https://[::1]garbage"));
+        assert!(!debug_str.contains("https://[::1]garbage:8080"));
+        assert!(!debug_str.contains("https://[not-ipv6]"));
+        assert!(debug_str.contains("[]") || debug_str.contains("List([])"));
+    }
+
+    #[test]
+    fn test_cors_wildcard_handling() {
+        let wildcard_only = vec![CORS_WILDCARD.to_string()];
+        let allow_origin = build_allow_origin(&wildcard_only);
+        let debug_str = format!("{:?}", allow_origin);
+        assert!(debug_str.contains(r#"Const("*")"#));
+
+        let mixed = vec![CORS_WILDCARD.to_string(), "https://example.com".to_string()];
+        let allow_origin_mixed = build_allow_origin(&mixed);
+        let mixed_debug_str = format!("{:?}", allow_origin_mixed);
+        assert!(mixed_debug_str.contains(r#"Const("*")"#));
     }
 }

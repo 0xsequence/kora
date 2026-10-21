@@ -1,8 +1,11 @@
-use serde::{Deserialize, Serialize};
+use http::HeaderValue;
+use serde::{Deserialize, Deserializer, Serialize};
 use solana_sdk::pubkey::Pubkey;
+use solana_transaction::versioned::TransactionVersion;
 use spl_token_2022_interface::extension::ExtensionType;
-use std::{fs, path::Path, str::FromStr};
+use std::{env, fs, path::Path, str::FromStr};
 use toml;
+use url::Url;
 use utoipa::ToSchema;
 
 use crate::{
@@ -24,8 +27,79 @@ use crate::{
     },
 };
 
-// Re-export usage limit configs
 pub use crate::usage_limit::{UsageLimitConfig, UsageLimitRuleConfig};
+
+pub const CORS_WILDCARD: &str = "*";
+
+/// Validates a CORS origin `scheme://host[:port]` without path, query, fragment, or trailing slash.
+pub fn is_valid_cors_origin(origin: &str) -> bool {
+    if origin == CORS_WILDCARD {
+        return true;
+    }
+
+    let url = match Url::parse(origin) {
+        Ok(u) => u,
+        Err(_) => return false,
+    };
+
+    if url.scheme() != "http" && url.scheme() != "https" {
+        return false;
+    }
+
+    if url.path() != "" && url.path() != "/" {
+        return false;
+    }
+
+    if url.query().is_some() || url.fragment().is_some() {
+        return false;
+    }
+
+    if !url.username().is_empty() || url.password().is_some() {
+        return false;
+    }
+
+    // A valid origin per Fetch spec exactly matches its ascii_serialization.
+    origin == url.origin().ascii_serialization()
+}
+
+pub enum CorsOriginsClassification {
+    Empty,
+    AllInvalid,
+    Wildcard { has_redundant: bool },
+    ValidWithSomeInvalid { valid_origins: Vec<HeaderValue>, invalid_origins: Vec<String> },
+    AllValid { valid_origins: Vec<HeaderValue> },
+}
+
+pub fn classify_cors_origins(origins: &[String]) -> CorsOriginsClassification {
+    if origins.is_empty() {
+        return CorsOriginsClassification::Empty;
+    }
+
+    if origins.iter().any(|o| o == CORS_WILDCARD) {
+        return CorsOriginsClassification::Wildcard { has_redundant: origins.len() > 1 };
+    }
+
+    let mut valid_origins = Vec::new();
+    let mut invalid_origins = Vec::new();
+
+    for o in origins {
+        if is_valid_cors_origin(o) {
+            if let Ok(hv) = o.parse::<HeaderValue>() {
+                valid_origins.push(hv);
+                continue;
+            }
+        }
+        invalid_origins.push(o.clone());
+    }
+
+    if valid_origins.is_empty() {
+        CorsOriginsClassification::AllInvalid
+    } else if !invalid_origins.is_empty() {
+        CorsOriginsClassification::ValidWithSomeInvalid { valid_origins, invalid_origins }
+    } else {
+        CorsOriginsClassification::AllValid { valid_origins }
+    }
+}
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -185,10 +259,37 @@ impl ProgramsConfig {
     }
 }
 
+fn transaction_versions_schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+    use utoipa::openapi::{schema::Type, ArrayBuilder, ObjectBuilder, OneOfBuilder};
+    ArrayBuilder::new()
+        .items(
+            OneOfBuilder::new()
+                .item(
+                    ObjectBuilder::new()
+                        .schema_type(Type::String)
+                        .enum_values(Some(vec!["legacy"])),
+                )
+                .item(
+                    ObjectBuilder::new()
+                        .schema_type(Type::Integer)
+                        .minimum(Some(0))
+                        .maximum(Some(255)),
+                ),
+        )
+        .description(Some(
+            "Transaction message versions accepted: any of \"legacy\", 0, 1.\nDefault: all versions.",
+        ))
+        .into()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ValidationConfig {
     pub max_allowed_lamports: u64,
+    /// Maximum priority fee in lamports a transaction may request.
+    /// Unset = unlimited, 0 = not allowed.
+    #[serde(default)]
+    pub max_priority_fee_lamports: Option<u64>,
     pub max_signatures: u64,
     pub allowed_programs: ProgramsConfig,
     pub allowed_tokens: Vec<String>,
@@ -206,6 +307,11 @@ pub struct ValidationConfig {
     /// WARNING: Enabling with dynamic pricing creates price arbitrage risk.
     #[serde(default)]
     pub allow_durable_transactions: bool,
+    /// Transaction message versions accepted: any of "legacy", 0, 1.
+    /// Default: all versions.
+    #[serde(default = "default_allowed_transaction_versions")]
+    #[schema(schema_with = transaction_versions_schema)]
+    pub allowed_transaction_versions: Vec<TransactionVersion>,
     /// Maximum allowed age of oracle price data in slots. 0 = disabled (default).
     /// When >0, prices with a block_id older than `current_slot - max_price_staleness_slots` are rejected.
     #[serde(default)]
@@ -223,6 +329,10 @@ pub struct ValidationConfig {
     pub cross_cluster_check: bool,
     #[serde(default = "default_cross_cluster_endpoints")]
     pub cross_cluster_endpoints: Vec<String>,
+}
+
+pub(crate) fn default_allowed_transaction_versions() -> Vec<TransactionVersion> {
+    vec![TransactionVersion::LEGACY, TransactionVersion::Number(0), TransactionVersion::Number(1)]
 }
 
 fn default_cross_cluster_endpoints() -> Vec<String> {
@@ -297,11 +407,11 @@ pub struct SplTokenInstructionPolicy {
     pub allow_approve: bool,
     /// Allow fee payer to be the owner in SPL Token Revoke instructions
     pub allow_revoke: bool,
-    /// Allow fee payer to be the current authority in SPL Token SetAuthority instructions
+    /// Allow fee payer to be the current or the new authority in SPL Token SetAuthority instructions
     pub allow_set_authority: bool,
     /// Allow fee payer to be the mint authority in SPL Token MintTo/MintToChecked instructions
     pub allow_mint_to: bool,
-    /// Allow fee payer to be the mint authority in SPL Token InitializeMint/InitializeMint2 instructions
+    /// Allow fee payer to be the mint or freeze authority in SPL Token InitializeMint/InitializeMint2 instructions
     pub allow_initialize_mint: bool,
     /// Allow fee payer to be set as the owner in SPL Token InitializeAccount instructions
     pub allow_initialize_account: bool,
@@ -332,11 +442,11 @@ pub struct Token2022InstructionPolicy {
     pub allow_approve: bool,
     /// Allow fee payer to be the owner in Token2022 Revoke instructions
     pub allow_revoke: bool,
-    /// Allow fee payer to be the current authority in Token2022 SetAuthority instructions
+    /// Allow fee payer to be the current or the new authority in Token2022 SetAuthority instructions
     pub allow_set_authority: bool,
     /// Allow fee payer to be the mint authority in Token2022 MintTo/MintToChecked instructions
     pub allow_mint_to: bool,
-    /// Allow fee payer to be the mint authority in Token2022 InitializeMint/InitializeMint2 instructions
+    /// Allow fee payer to be the mint or freeze authority in Token2022 InitializeMint/InitializeMint2 instructions
     pub allow_initialize_mint: bool,
     /// Allow fee payer to be set as the owner in Token2022 InitializeAccount instructions
     pub allow_initialize_account: bool,
@@ -386,13 +496,14 @@ pub struct BpfLoaderUpgradeableInstructionPolicy {
     pub allow_deploy_with_max_data_len: bool,
     /// Allow fee payer to be the upgrade authority in Upgrade instructions
     pub allow_upgrade: bool,
-    /// Allow fee payer to be the current authority in SetAuthority (drainage vector — hands
-    /// program control to a new authority that can then close + drain)
+    /// Allow fee payer to be the current or the new authority in SetAuthority (drainage vector
+    /// — hands program control to a new authority that can then close + drain)
     pub allow_set_authority: bool,
-    /// Allow fee payer to be the current authority in SetAuthorityChecked
+    /// Allow fee payer to be the current or the new authority in SetAuthorityChecked
     pub allow_set_authority_checked: bool,
-    /// Allow fee payer to be the authority or recipient in Close instructions
-    /// (drainage vector — recipient gets the closed-account lamports)
+    /// Allow fee payer to be the authority in Close instructions. The recipient slot is not
+    /// flag-gated: an unconditional drainage guard rejects a fee-payer authority paired with a
+    /// foreign recipient
     pub allow_close: bool,
     /// Allow fee payer to be the payer in ExtendProgram instructions
     pub allow_extend_program: bool,
@@ -411,13 +522,15 @@ pub struct LoaderV4InstructionPolicy {
     pub allow_write: bool,
     /// Allow fee payer to be the authority in Copy instructions
     pub allow_copy: bool,
-    /// Allow fee payer to be the authority in SetProgramLength instructions
+    /// Allow fee payer to be the authority or the recipient in SetProgramLength instructions. An
+    /// unconditional drainage guard additionally requires the recipient to be the fee payer
+    /// whenever the fee payer is the authority
     pub allow_set_program_length: bool,
     /// Allow fee payer to be the authority in Deploy instructions
     pub allow_deploy: bool,
     /// Allow fee payer to be the authority in Retract instructions
     pub allow_retract: bool,
-    /// Allow fee payer to be the current authority in TransferAuthority instructions
+    /// Allow fee payer to be the current or the new authority in TransferAuthority instructions
     pub allow_transfer_authority: bool,
     /// Allow fee payer to be the current authority in Finalize instructions
     pub allow_finalize: bool,
@@ -457,8 +570,7 @@ pub enum TransferHookPolicy {
 }
 
 impl Token2022Config {
-    /// Initialize and parse extension strings into ExtensionTypes
-    /// This should be called after deserialization to populate the cached fields
+    /// Must be called after deserialization to populate the cached extension fields.
     pub fn initialize(&mut self) -> Result<(), String> {
         let mut mint_extensions = Vec::new();
         for name in &self.blocked_mint_extensions {
@@ -497,17 +609,14 @@ impl Token2022Config {
         Ok(())
     }
 
-    /// Get all blocked mint extensions as ExtensionType
     pub fn get_blocked_mint_extensions(&self) -> &[ExtensionType] {
         self.parsed_blocked_mint_extensions.as_deref().unwrap_or(&[])
     }
 
-    /// Get all blocked account extensions as ExtensionType
     pub fn get_blocked_account_extensions(&self) -> &[ExtensionType] {
         self.parsed_blocked_account_extensions.as_deref().unwrap_or(&[])
     }
 
-    /// Check if a mint extension is blocked
     pub fn is_mint_extension_blocked(&self, ext: ExtensionType) -> bool {
         match &self.parsed_blocked_mint_extensions {
             Some(exts) => exts.contains(&ext),
@@ -518,7 +627,6 @@ impl Token2022Config {
         }
     }
 
-    /// Check if an account extension is blocked
     pub fn is_account_extension_blocked(&self, ext: ExtensionType) -> bool {
         match &self.parsed_blocked_account_extensions {
             Some(exts) => exts.contains(&ext),
@@ -551,67 +659,29 @@ pub struct EnabledMethods {
 
 impl EnabledMethods {
     pub fn iter(&self) -> impl Iterator<Item = bool> {
-        [
-            self.liveness,
-            self.estimate_transaction_fee,
-            self.get_supported_tokens,
-            self.get_payer_signer,
-            self.sign_transaction,
-            self.sign_and_send_transaction,
-            self.transfer_transaction,
-            self.get_blockhash,
-            self.get_config,
-            self.get_version,
-            self.estimate_bundle_fee,
-            self.sign_and_send_bundle,
-            self.sign_bundle,
-        ]
-        .into_iter()
+        self.into_iter()
     }
 
-    /// Returns a Vec of enabled JSON-RPC method names
     pub fn get_enabled_method_names(&self) -> Vec<String> {
-        let mut methods = Vec::new();
-        if self.liveness {
-            methods.push("liveness".to_string());
-        }
-        if self.estimate_transaction_fee {
-            methods.push("estimateTransactionFee".to_string());
-        }
-        if self.estimate_bundle_fee {
-            methods.push("estimateBundleFee".to_string());
-        }
-        if self.get_supported_tokens {
-            methods.push("getSupportedTokens".to_string());
-        }
-        if self.get_payer_signer {
-            methods.push("getPayerSigner".to_string());
-        }
-        if self.sign_transaction {
-            methods.push("signTransaction".to_string());
-        }
-        if self.sign_and_send_transaction {
-            methods.push("signAndSendTransaction".to_string());
-        }
-        if self.transfer_transaction {
-            methods.push("transferTransaction".to_string());
-        }
-        if self.get_blockhash {
-            methods.push("getBlockhash".to_string());
-        }
-        if self.get_config {
-            methods.push("getConfig".to_string());
-        }
-        if self.get_version {
-            methods.push("getVersion".to_string());
-        }
-        if self.sign_and_send_bundle {
-            methods.push("signAndSendBundle".to_string());
-        }
-        if self.sign_bundle {
-            methods.push("signBundle".to_string());
-        }
-        methods
+        [
+            (self.liveness, "liveness"),
+            (self.estimate_transaction_fee, "estimateTransactionFee"),
+            (self.estimate_bundle_fee, "estimateBundleFee"),
+            (self.get_supported_tokens, "getSupportedTokens"),
+            (self.get_payer_signer, "getPayerSigner"),
+            (self.sign_transaction, "signTransaction"),
+            (self.sign_and_send_transaction, "signAndSendTransaction"),
+            (self.transfer_transaction, "transferTransaction"),
+            (self.get_blockhash, "getBlockhash"),
+            (self.get_config, "getConfig"),
+            (self.get_version, "getVersion"),
+            (self.sign_and_send_bundle, "signAndSendBundle"),
+            (self.sign_bundle, "signBundle"),
+        ]
+        .into_iter()
+        .filter(|(enabled, _)| *enabled)
+        .map(|(_, name)| name.to_string())
+        .collect()
     }
 }
 
@@ -714,6 +784,7 @@ pub struct PluginsConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct KoraConfig {
     pub rate_limit: u64,
+    pub cors_allow_origins: Vec<String>,
     pub max_request_body_size: usize,
     pub enabled_methods: EnabledMethods,
     pub auth: AuthConfig,
@@ -740,6 +811,7 @@ impl Default for KoraConfig {
     fn default() -> Self {
         Self {
             rate_limit: 100,
+            cors_allow_origins: vec![CORS_WILDCARD.to_string()],
             max_request_body_size: DEFAULT_MAX_REQUEST_BODY_SIZE,
             enabled_methods: EnabledMethods::default(),
             auth: AuthConfig::default(),
@@ -783,10 +855,36 @@ impl Default for LighthouseConfig {
     }
 }
 
+fn deserialize_api_keys<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum ApiKeys {
+        String(String),
+        Vec(Vec<String>),
+    }
+
+    let keys = match Option::<ApiKeys>::deserialize(deserializer)? {
+        Some(ApiKeys::String(key)) => vec![key],
+        Some(ApiKeys::Vec(keys)) => keys,
+        None => vec![],
+    };
+    let keys: Vec<String> = keys
+        .iter()
+        .map(|key| key.trim())
+        .filter(|key| !key.is_empty())
+        .map(str::to_string)
+        .collect();
+    Ok((!keys.is_empty()).then_some(keys))
+}
+
 #[derive(Clone, Serialize, Deserialize, ToSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct AuthConfig {
-    pub api_key: Option<String>,
+    #[serde(alias = "api_key", deserialize_with = "deserialize_api_keys")]
+    pub api_keys: Option<Vec<String>>,
     pub hmac_secret: Option<String>,
     pub recaptcha_secret: Option<String>,
     pub recaptcha_score_threshold: f64,
@@ -797,7 +895,7 @@ pub struct AuthConfig {
 impl Default for AuthConfig {
     fn default() -> Self {
         Self {
-            api_key: None,
+            api_keys: None,
             hmac_secret: None,
             recaptcha_secret: None,
             recaptcha_score_threshold: DEFAULT_RECAPTCHA_SCORE_THRESHOLD,
@@ -823,8 +921,12 @@ impl AuthConfig {
             .or_else(|| Self::normalize_optional_secret(config_value.map(str::to_string)))
     }
 
-    pub(crate) fn resolved_api_key(&self) -> Option<String> {
-        Self::resolve_secret(Self::API_KEY_ENV, self.api_key.as_deref())
+    pub(crate) fn resolved_api_keys(&self) -> Option<Vec<String>> {
+        if let Some(env_key) = Self::normalize_optional_secret(env::var(Self::API_KEY_ENV).ok()) {
+            Some(vec![env_key])
+        } else {
+            self.api_keys.clone()
+        }
     }
 
     pub(crate) fn resolved_hmac_secret(&self) -> Option<String> {
@@ -837,29 +939,56 @@ impl AuthConfig {
 
     /// Whether API-key or HMAC auth is in effect after env-first resolution (what the server enforces).
     pub(crate) fn has_resolved_auth(&self) -> bool {
-        self.resolved_api_key().is_some() || self.resolved_hmac_secret().is_some()
+        self.resolved_api_keys().is_some() || self.resolved_hmac_secret().is_some()
     }
 
     /// Auth fields where a non-empty environment variable overrides a *different* non-empty
-    /// kora.toml value. Returns `(env_var, config_field_label)`; never returns secret contents.
-    pub(crate) fn env_overridden_fields(&self) -> Vec<(&'static str, &'static str)> {
-        [
-            (Self::API_KEY_ENV, "[kora.auth].api_key", self.api_key.as_deref()),
+    /// kora.toml value. Returns fully-formed warning messages.
+    pub(crate) fn env_overridden_fields(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+
+        let standard_warning = |env_var: &str, field: &str| {
+            format!(
+                "⚠️  SECURITY: environment variable {} overrides {}. The environment \
+                 value takes precedence at runtime; if you rotated the secret in kora.toml, the \
+                 stale environment value is still in effect. Unset {} or align it with the config.",
+                env_var, field, env_var
+            )
+        };
+
+        if let Some(env_val) = Self::normalize_optional_secret(env::var(Self::API_KEY_ENV).ok()) {
+            if let Some(cfg_keys) = &self.api_keys {
+                if cfg_keys.len() > 1 {
+                    warnings.push(format!(
+                        "⚠️  SECURITY: environment variable {} overrides ALL {} configured keys \
+                         in [kora.auth].api_keys. The environment value takes precedence at runtime. \
+                         Unset {} to use the multiple configured keys.",
+                        Self::API_KEY_ENV,
+                        cfg_keys.len(),
+                        Self::API_KEY_ENV
+                    ));
+                } else if cfg_keys.len() == 1 && cfg_keys[0] != env_val {
+                    warnings.push(standard_warning(Self::API_KEY_ENV, "[kora.auth].api_keys"));
+                }
+            }
+        }
+
+        for (env_var, label, config_value) in [
             (Self::HMAC_SECRET_ENV, "[kora.auth].hmac_secret", self.hmac_secret.as_deref()),
             (
                 Self::RECAPTCHA_SECRET_ENV,
                 "[kora.auth].recaptcha_secret",
                 self.recaptcha_secret.as_deref(),
             ),
-        ]
-        .into_iter()
-        .filter(|(env_var, _, config_value)| {
+        ] {
             let env_value = Self::normalize_optional_secret(std::env::var(env_var).ok());
             let config_value = Self::normalize_optional_secret(config_value.map(str::to_string));
-            matches!((env_value, config_value), (Some(env), Some(cfg)) if env != cfg)
-        })
-        .map(|(env_var, label, _)| (env_var, label))
-        .collect()
+            if matches!((env_value, config_value), (Some(env), Some(cfg)) if env != cfg) {
+                warnings.push(standard_warning(env_var, label));
+            }
+        }
+
+        warnings
     }
 }
 
@@ -879,7 +1008,6 @@ impl Config {
             ))
         })?;
 
-        // Initialize Token2022Config to parse and cache extensions
         config.validation.token_2022.initialize().map_err(|e| {
             KoraError::InternalServerError(format!(
                 "Failed to initialize Token2022 config: {}",
@@ -913,6 +1041,51 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn test_is_valid_cors_origin_table() {
+        let cases = vec![
+            (CORS_WILDCARD, true),
+            // Valid IPv4/Hostnames
+            ("https://example.com", true),
+            ("http://example.com", true),
+            ("https://example.com:8080", true),
+            ("https://localhost", true),
+            ("https://127.0.0.1", true),
+            // Valid IPv6
+            ("https://[::1]", true),
+            ("https://[::1]:8080", true),
+            ("https://[2001:db8::1]", true),
+            // Malformed/Empty hosts
+            ("https://", false),
+            ("https://:8080", false),
+            ("https://[]:8080", false),
+            ("https://example.com:", false),
+            // Invalid IPv6 brackets
+            ("https://[not-ipv6]", false),
+            ("https://[::1]garbage", false),
+            ("https://[::1]garbage:8080", false),
+            // Invalid ports
+            ("https://example.com:badport", false),
+            ("https://example.com:99999", false),
+            // Userinfo/Credentials
+            ("https://user@example.com", false),
+            ("https://user:pass@example.com", false),
+            // Paths, Queries, Fragments
+            ("https://example.com/", false),
+            ("https://example.com/path", false),
+            ("https://example.com?q=1", false),
+            ("https://example.com#frag", false),
+            // Other invalid schemes
+            ("ftp://example.com", false),
+            ("ws://example.com", false),
+            ("example.com", false),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(is_valid_cors_origin(input), expected, "Failed on input: '{}'", input);
+        }
+    }
 
     #[test]
     fn test_load_valid_config() {
@@ -1015,6 +1188,67 @@ mod tests {
         assert_eq!(config.validation.allowed_programs, ProgramsConfig::All);
     }
 
+    fn validation_toml_with(extra: &str) -> String {
+        format!(
+            r#"
+            [validation]
+            max_allowed_lamports = 1
+            max_signatures = 1
+            allowed_programs = []
+            allowed_tokens = []
+            allowed_spl_paid_tokens = []
+            disallowed_accounts = []
+            price_source = "Mock"
+            {extra}
+
+            [kora]
+            rate_limit = 1
+            "#
+        )
+    }
+
+    #[test]
+    fn test_allowed_transaction_versions_defaults_to_all() {
+        let config = crate::tests::toml_mock::create_invalid_config(&validation_toml_with(""))
+            .expect("TOML without allowed_transaction_versions should parse");
+        assert_eq!(
+            config.validation.allowed_transaction_versions,
+            vec![
+                TransactionVersion::LEGACY,
+                TransactionVersion::Number(0),
+                TransactionVersion::Number(1)
+            ]
+        );
+    }
+
+    #[test]
+    fn test_allowed_transaction_versions_parses_mixed_array() {
+        let config = crate::tests::toml_mock::create_invalid_config(&validation_toml_with(
+            r#"allowed_transaction_versions = ["legacy", 1]"#,
+        ))
+        .expect("TOML with a mixed allowed_transaction_versions array should parse");
+        assert_eq!(
+            config.validation.allowed_transaction_versions,
+            vec![TransactionVersion::LEGACY, TransactionVersion::Number(1)]
+        );
+    }
+
+    #[test]
+    fn test_allowed_transaction_versions_rejects_non_version_values() {
+        for value in [r#"["0"]"#, r#"["v0"]"#, r#"["Legacy"]"#, "[256]", "[-1]"] {
+            let result = crate::tests::toml_mock::create_invalid_config(&validation_toml_with(
+                &format!("allowed_transaction_versions = {value}"),
+            ));
+            assert!(result.is_err(), "allowed_transaction_versions = {value} should not parse");
+        }
+    }
+
+    #[test]
+    fn test_transaction_version_json_serialization() {
+        let json = serde_json::to_string(&default_allowed_transaction_versions()).unwrap();
+        assert_eq!(json, r#"["legacy",0,1]"#);
+    }
+
     #[test]
     fn test_allowed_programs_json_serialization() {
         // ProgramsConfig::All must serialize as the string "All" — the user-facing
@@ -1064,9 +1298,7 @@ mod tests {
         let config = ConfigBuilder::new().with_free_price().build_config().unwrap();
 
         match &config.validation.price.model {
-            PriceModel::Free => {
-                // Test passed
-            }
+            PriceModel::Free => {}
             _ => panic!("Expected Free price model"),
         }
     }
@@ -1075,7 +1307,6 @@ mod tests {
     fn test_parse_missing_price_config() {
         let config = ConfigBuilder::new().build_config().unwrap();
 
-        // Should default to Margin with 0.0 margin
         match &config.validation.price.model {
             PriceModel::Margin { margin } => {
                 assert_eq!(*margin, 0.0);
@@ -1209,7 +1440,6 @@ rate_limit = 1
             .build_config()
             .unwrap();
 
-        // Test mint extension blocking
         assert!(config
             .validation
             .token_2022
@@ -1220,7 +1450,6 @@ rate_limit = 1
             .token_2022
             .is_mint_extension_blocked(ExtensionType::NonTransferable));
 
-        // Test account extension blocking
         assert!(config
             .validation
             .token_2022
@@ -1324,9 +1553,7 @@ allow_create = true
 
     #[test]
     fn test_signing_config_with_cache_and_methods() {
-        // This test ensures that signing configuration fields are correctly parsed
-        // even when other sub-sections (cache, enabled_methods) are present.
-        // This acts as a regression test for TOML serialization ordering.
+        // Regression test: signing fields must parse correctly regardless of TOML section ordering.
         let config = ConfigBuilder::new()
             .with_signing_config(15, 5)
             .with_cache_config(Some("http://localhost:6379"), true, 60, 3600)
@@ -1337,7 +1564,6 @@ allow_create = true
         assert_eq!(config.kora.sign_timeout_seconds, 15);
         assert_eq!(config.kora.sign_max_retries, 5);
 
-        // Verify other sections to ensure they were also parsed correctly
         assert_eq!(config.kora.cache.url, Some("http://localhost:6379".to_string()));
         assert!(config.kora.cache.enabled);
 
@@ -1453,5 +1679,47 @@ allow_create = true
             )
             .build_config();
         assert_unknown_field_error(result, "unknown_rule_field");
+    }
+
+    #[test]
+    fn test_legacy_api_key_backward_compatibility() {
+        let toml_str = r#"
+        api_key = "single-key"
+        "#;
+        let auth: AuthConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(auth.api_keys, Some(vec!["single-key".to_string()]));
+    }
+
+    #[test]
+    fn test_api_keys_with_empty_strings_filtered() {
+        let toml_str = r#"
+        api_keys = ["valid-key", "  ", ""]
+        "#;
+        let auth: AuthConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(auth.api_keys, Some(vec!["valid-key".to_string()]));
+    }
+
+    #[test]
+    fn test_api_keys_all_empty_strings_filtered() {
+        let toml_str = r#"
+        api_keys = ["", "  "]
+        "#;
+        let auth: AuthConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(auth.api_keys, None);
+        assert_eq!(auth.has_resolved_auth(), false);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_env_overridden_fields_multiple_keys_backup_dropped() {
+        let mut auth = AuthConfig::default();
+        auth.api_keys = Some(vec!["key1".to_string(), "key2".to_string()]);
+
+        env::set_var("KORA_API_KEY", "env-key");
+
+        let warnings = auth.env_overridden_fields();
+        assert!(warnings.iter().any(|w| w.contains("overrides ALL 2 configured keys")));
+
+        env::remove_var("KORA_API_KEY");
     }
 }

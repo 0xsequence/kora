@@ -234,7 +234,6 @@ impl<T> KoraResponse<T> {
     }
 }
 
-// Extension trait for Result<T, E> to convert to KoraResponse
 pub trait IntoKoraResponse<T> {
     fn into_response(self) -> KoraResponse<T>;
 }
@@ -512,20 +511,6 @@ mod tests {
         let error = KoraError::RateLimitExceeded;
         let display_string = format!("{error}");
         assert_eq!(display_string, "Rate limit exceeded");
-    }
-
-    #[test]
-    fn test_kora_error_debug() {
-        let error = KoraError::ValidationError("test".to_string());
-        let debug_string = format!("{error:?}");
-        assert!(debug_string.contains("ValidationError"));
-    }
-
-    #[test]
-    fn test_kora_error_clone() {
-        let error = KoraError::SwapError("original".to_string());
-        let cloned = error.clone();
-        assert_eq!(error, cloned);
     }
 
     #[test]

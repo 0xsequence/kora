@@ -1,9 +1,15 @@
 [kora]
 rate_limit = 100
 
+# Allowed CORS origins. Defaults to ["*"] (allow all).
+# Set to specific origins for production deployments.
+# cors_allow_origins = ["https://your-app.com", "https://admin.your-app.com"]
+cors_allow_origins = ["*"]
+
 [kora.auth]
 # Optional: API key for simple authentication
-# api_key = "your-api-key"
+# api_key = "your-api-key"  # Deprecated: use api_keys array instead
+# api_keys = ["key-1", "key-2"]  # Supports multiple API keys
 
 # Optional: HMAC secret for signed requests
 # hmac_secret = "your-hmac-secret"
@@ -51,9 +57,14 @@ get_version = true
 
 [validation]
 max_allowed_lamports = 1000000
+# Max priority fee in lamports (unset = unlimited, 0 = none).
+# Covers ComputeBudget instructions and the v1 transaction config.
+# max_priority_fee_lamports = 100000
 max_signatures = 10
 price_source = "Mock"
 allow_durable_transactions = false
+# Transaction versions to accept (default: all).
+# allowed_transaction_versions = ["legacy", 0, 1]
 cross_cluster_check = false
 cross_cluster_endpoints = [
     "https://api.mainnet-beta.solana.com",

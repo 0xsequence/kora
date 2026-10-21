@@ -1,22 +1,16 @@
+use super::sign_bundle::{sign_bundle_transactions, SignBundleRequest};
 use crate::{
-    bundle::{BundleError, BundleProcessingMode, BundleProcessor, JitoBundleClient, JitoError},
-    plugin::PluginExecutionContext,
-    rpc_server::middleware_utils::default_sig_verify,
-    transaction::TransactionUtil,
-    validator::bundle_validator::BundleValidator,
-    KoraError,
+    bundle::JitoBundleClient, plugin::PluginExecutionContext,
+    rpc_server::middleware_utils::default_sig_verify, KoraError,
 };
 use serde::{Deserialize, Serialize};
 use solana_client::nonblocking::rpc_client::RpcClient;
-use solana_keychain::SolanaSigner;
 use std::sync::Arc;
 use utoipa::ToSchema;
 
 #[cfg(not(test))]
-use crate::state::{get_config, select_request_signer_with_signer_key};
+use crate::state::get_config;
 
-#[cfg(test)]
-use crate::state::select_request_signer_with_signer_key;
 #[cfg(test)]
 use crate::tests::config_mock::mock_state::get_config;
 
@@ -60,84 +54,14 @@ pub async fn sign_and_send_bundle(
         sign_only_indices,
     } = request;
     let config = &get_config()?;
-
-    if !config.kora.bundle.enabled {
-        return Err(BundleError::Jito(JitoError::NotEnabled).into());
-    }
-
-    // Validate bundle size on ALL transactions first
-    BundleValidator::validate_jito_bundle_size(&transactions)?;
-
-    // Extract only the transactions we need to process
-    let (transactions_to_process, index_to_position) =
-        BundleProcessor::extract_transactions_to_process(&transactions, sign_only_indices.clone())?;
-
-    let signer = select_request_signer_with_signer_key(signer_key.as_deref())?;
-    let fee_payer = signer.pubkey();
-    let payment_destination = config.kora.get_payment_address(&fee_payer)?;
-
-    let sig_verify = sig_verify || config.kora.force_sig_verify;
-    let processor = BundleProcessor::process_bundle(
-        &transactions_to_process,
-        fee_payer,
-        &payment_destination,
-        config,
+    let (signed_transactions, fee_payer) = sign_bundle_transactions(
         rpc_client,
-        sig_verify,
-        Some(PluginExecutionContext::SignAndSendBundle),
-        BundleProcessingMode::CheckUsage(user_id.as_deref()),
+        config,
+        SignBundleRequest { transactions, signer_key, sig_verify, user_id, sign_only_indices },
+        PluginExecutionContext::SignAndSendBundle,
     )
     .await?;
 
-    let signed_indices = BundleValidator::signed_indices_for_bundle(
-        transactions.len(),
-        sign_only_indices.as_deref(),
-    );
-
-    // When sig_verify = false (default), simulation accepts unsigned transactions
-    // (skipSigVerify = true). Validate the bundle sequentially before calling the
-    // signer so that invalid bundles are rejected before consuming signer resources.
-    if !sig_verify {
-        BundleValidator::simulate_and_validate_sequential_bundle(
-            rpc_client,
-            config,
-            &transactions,
-            &signed_indices,
-            &fee_payer,
-            true,
-        )
-        .await?;
-    }
-
-    let signed_resolved = processor.sign_all(&signer, &fee_payer, rpc_client, config, true).await?;
-
-    // Encode signed transactions
-    let encoded_signed: Vec<String> = signed_resolved
-        .iter()
-        .map(|r| TransactionUtil::encode_versioned_transaction(&r.transaction))
-        .collect::<Result<Vec<_>, _>>()?;
-
-    // Merge signed transactions back into original positions
-    let signed_transactions = BundleProcessor::merge_signed_transactions(
-        &transactions,
-        encoded_signed,
-        &index_to_position,
-    );
-
-    // When sig_verify = true, simulation needs real signatures: validate after signing.
-    if sig_verify {
-        BundleValidator::simulate_and_validate_sequential_bundle(
-            rpc_client,
-            config,
-            &signed_transactions,
-            &signed_indices,
-            &fee_payer,
-            false,
-        )
-        .await?;
-    }
-
-    // Send the full merged bundle to Jito for atomic execution.
     let jito_client = JitoBundleClient::new(&config.kora.bundle.jito);
     let bundle_uuid = jito_client.send_bundle(&signed_transactions).await?;
 
@@ -156,6 +80,7 @@ mod tests {
         tests::{
             common::{setup_or_get_test_signer, setup_or_get_test_usage_limiter, RpcMockBuilder},
             config_mock::{mock_state::setup_config_mock, ConfigMockBuilder},
+            transaction_mock::create_mock_encoded_transaction,
         },
         transaction::TransactionUtil,
     };
@@ -164,6 +89,7 @@ mod tests {
     use solana_message::{Message, VersionedMessage};
     use solana_sdk::pubkey::Pubkey;
     use solana_system_interface::instruction::transfer;
+    use solana_transaction::versioned::TransactionVersion;
 
     #[tokio::test]
     async fn test_sign_and_send_bundle_empty_bundle() {
@@ -538,5 +464,32 @@ mod tests {
         let err = result.unwrap_err().to_string();
         assert!(err.contains("Total transfer amount"), "Unexpected error: {err}");
         assert!(err.contains("exceeds maximum allowed"), "Unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_sign_and_send_bundle_rejects_disallowed_transaction_version() {
+        let _m = ConfigMockBuilder::new()
+            .with_bundle_enabled(true)
+            .with_allowed_transaction_versions(vec![TransactionVersion::Number(0)])
+            .build_and_setup();
+        let _ = setup_or_get_test_signer();
+        let _ = setup_or_get_test_usage_limiter().await;
+
+        let rpc_client = Arc::new(RpcMockBuilder::new().with_simulation().build());
+
+        let request = SignAndSendBundleRequest {
+            transactions: vec![create_mock_encoded_transaction()],
+            signer_key: None,
+            sig_verify: false,
+            user_id: None,
+            sign_only_indices: None,
+        };
+
+        let result = sign_and_send_bundle(&rpc_client, request).await;
+
+        assert_eq!(
+            result.unwrap_err(),
+            KoraError::InvalidTransaction("Transaction version is not allowed".to_string())
+        );
     }
 }
