@@ -16,6 +16,9 @@ on:
         description: "The actual artifact name with hash suffix"
         value: ${{ jobs.build.outputs.artifact-name }}
 
+permissions:
+  contents: read
+
 jobs:
   build:
     name: Build Rust Artifacts
@@ -24,13 +27,16 @@ jobs:
     outputs:
       artifact-name: ${{ inputs.artifact-name }}-${{ steps.source-hash.outputs.hash }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-07-13
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: ${{ inputs.cache-key }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Calculate source files hash
         id: source-hash
@@ -40,18 +46,19 @@ jobs:
           echo "Source files hash: $SOURCE_HASH"
 
       - name: Install just
-        uses: extractions/setup-just@v4
+        uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
         with:
           just-version: "1.50.0"
 
       - name: Build workspace
         run: just build
 
+      - name: Compile integration test dependencies
+        run: cargo test --no-run --workspace
+
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ inputs.artifact-name }}-${{ steps.source-hash.outputs.hash }}
-          path: |
-            target/debug/kora
-            target/debug/test_runner
+          path: target/debug/kora
           retention-days: 1

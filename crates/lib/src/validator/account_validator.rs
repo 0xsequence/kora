@@ -31,76 +31,38 @@ impl AccountType {
         let mut should_be_owned_by: Option<Pubkey> = None;
 
         match self {
-            AccountType::Mint => match account.owner {
-                ref owner if *owner == SPL_TOKEN_PROGRAM_ID => {
-                    should_be_executable = Some(false);
-
-                    if account.data.len() < Mint::LEN {
-                        return Err(KoraError::InternalServerError(format!(
-                            "Account {account_pubkey} has invalid data for a Mint account: data too short"
-                        )));
+            AccountType::Mint => {
+                match account.owner {
+                    owner if owner == SPL_TOKEN_PROGRAM_ID => {
+                        check_packed::<Mint>(account, account_pubkey, "Mint")?
                     }
-                    Mint::unpack_from_slice(&account.data).map_err(|e| {
-                        KoraError::InternalServerError(format!(
-                            "Account {account_pubkey} has invalid data for a Mint account: {e}"
-                        ))
-                    })?;
-                }
-                ref owner if *owner == TOKEN_2022_PROGRAM_ID => {
-                    should_be_executable = Some(false);
-
-                    if account.data.len() < Token2022Mint::LEN {
-                        return Err(KoraError::InternalServerError(format!(
-                            "Account {account_pubkey} has invalid data for a Mint account: data too short"
-                        )));
+                    owner if owner == TOKEN_2022_PROGRAM_ID => {
+                        check_packed::<Token2022Mint>(account, account_pubkey, "Mint")?
                     }
-                    Token2022Mint::unpack_from_slice(&account.data).map_err(|e| {
-                        KoraError::InternalServerError(format!(
-                            "Account {account_pubkey} has invalid data for a Mint account: {e}"
-                        ))
-                    })?;
-                }
-                _ => {
-                    return Err(KoraError::InternalServerError(format!(
+                    _ => {
+                        return Err(KoraError::InternalServerError(format!(
                             "Account {account_pubkey} is not owned by a token program, cannot be a Mint"
                         )));
+                    }
                 }
-            },
-            AccountType::TokenAccount => match account.owner {
-                ref owner if *owner == SPL_TOKEN_PROGRAM_ID => {
-                    should_be_executable = Some(false);
-
-                    if account.data.len() < SplTokenAccount::LEN {
+                should_be_executable = Some(false);
+            }
+            AccountType::TokenAccount => {
+                match account.owner {
+                    owner if owner == SPL_TOKEN_PROGRAM_ID => {
+                        check_packed::<SplTokenAccount>(account, account_pubkey, "TokenAccount")?
+                    }
+                    owner if owner == TOKEN_2022_PROGRAM_ID => {
+                        check_packed::<Token2022Account>(account, account_pubkey, "TokenAccount")?
+                    }
+                    _ => {
                         return Err(KoraError::InternalServerError(format!(
-                            "Account {account_pubkey} has invalid data for a TokenAccount account: data too short"
+                            "Account {account_pubkey} is not owned by a token program, cannot be a TokenAccount"
                         )));
                     }
-                    SplTokenAccount::unpack_from_slice(&account.data).map_err(|e| {
-                        KoraError::InternalServerError(format!(
-                            "Account {account_pubkey} has invalid data for a TokenAccount account: {e}"
-                        ))
-                    })?;
                 }
-                ref owner if *owner == TOKEN_2022_PROGRAM_ID => {
-                    should_be_executable = Some(false);
-
-                    if account.data.len() < Token2022Account::LEN {
-                        return Err(KoraError::InternalServerError(format!(
-                            "Account {account_pubkey} has invalid data for a TokenAccount account: data too short"
-                        )));
-                    }
-                    Token2022Account::unpack_from_slice(&account.data).map_err(|e| {
-                        KoraError::InternalServerError(format!(
-                            "Account {account_pubkey} has invalid data for a TokenAccount account: {e}"
-                        ))
-                    })?;
-                }
-                _ => {
-                    return Err(KoraError::InternalServerError(format!(
-                                "Account {account_pubkey} is not owned by a token program, cannot be a TokenAccount"
-                            )));
-                }
-            },
+                should_be_executable = Some(false);
+            }
             AccountType::System => {
                 should_be_owned_by = Some(SYSTEM_PROGRAM_ID);
             }
@@ -129,6 +91,24 @@ impl AccountType {
 
         Ok(())
     }
+}
+
+fn check_packed<T: Pack>(
+    account: &Account,
+    account_pubkey: &Pubkey,
+    kind: &str,
+) -> Result<(), KoraError> {
+    if account.data.len() < T::LEN {
+        return Err(KoraError::InternalServerError(format!(
+            "Account {account_pubkey} has invalid data for a {kind} account: data too short"
+        )));
+    }
+    T::unpack_from_slice(&account.data).map_err(|e| {
+        KoraError::InternalServerError(format!(
+            "Account {account_pubkey} has invalid data for a {kind} account: {e}"
+        ))
+    })?;
+    Ok(())
 }
 
 pub async fn validate_account(
@@ -182,7 +162,7 @@ mod tests {
     #[test]
     fn test_account_type_validate_mint_wrong_owner() {
         let account = AccountMockBuilder::new()
-            .with_owner(Pubkey::new_unique()) // Wrong owner, not a token program
+            .with_owner(Pubkey::new_unique())
             .with_executable(false)
             .build();
         let account_pubkey = Pubkey::new_unique();
@@ -196,7 +176,7 @@ mod tests {
     fn test_account_type_validate_mint_executable() {
         let account = AccountMockBuilder::new()
             .with_owner(SPL_TOKEN_PROGRAM_ID)
-            .with_executable(true) // Mints should not be executable
+            .with_executable(true)
             .with_data(MintAccountMockBuilder::new().build().data)
             .build();
         let account_pubkey = Pubkey::new_unique();
@@ -211,7 +191,7 @@ mod tests {
         let account = AccountMockBuilder::new()
             .with_owner(SPL_TOKEN_PROGRAM_ID)
             .with_executable(false)
-            .with_data(vec![0u8; 10]) // Too short for mint data
+            .with_data(vec![0u8; 10])
             .build();
         let account_pubkey = Pubkey::new_unique();
 
@@ -248,7 +228,7 @@ mod tests {
     #[test]
     fn test_account_type_validate_token_account_wrong_owner() {
         let account = AccountMockBuilder::new()
-            .with_owner(Pubkey::new_unique()) // Wrong owner, not a token program
+            .with_owner(Pubkey::new_unique())
             .with_executable(false)
             .build();
         let account_pubkey = Pubkey::new_unique();
@@ -262,7 +242,7 @@ mod tests {
     fn test_account_type_validate_token_account_executable() {
         let account = AccountMockBuilder::new()
             .with_owner(SPL_TOKEN_PROGRAM_ID)
-            .with_executable(true) // Token accounts should not be executable
+            .with_executable(true)
             .with_data(TokenAccountMockBuilder::new().build().data)
             .build();
         let account_pubkey = Pubkey::new_unique();
@@ -277,7 +257,7 @@ mod tests {
         let account = AccountMockBuilder::new()
             .with_owner(SPL_TOKEN_PROGRAM_ID)
             .with_executable(false)
-            .with_data(vec![0u8; 10]) // Too short for token account data
+            .with_data(vec![0u8; 10])
             .build();
         let account_pubkey = Pubkey::new_unique();
 
@@ -332,7 +312,7 @@ mod tests {
         let account = AccountMockBuilder::new()
             .with_owner(TOKEN_2022_PROGRAM_ID)
             .with_executable(false)
-            .with_data(vec![0u8; 10]) // Too short for Token2022 mint data
+            .with_data(vec![0u8; 10])
             .build();
         let account_pubkey = Pubkey::new_unique();
 
@@ -346,7 +326,7 @@ mod tests {
         let account = AccountMockBuilder::new()
             .with_owner(TOKEN_2022_PROGRAM_ID)
             .with_executable(false)
-            .with_data(vec![0u8; 10]) // Too short for Token2022 account data
+            .with_data(vec![0u8; 10])
             .build();
         let account_pubkey = Pubkey::new_unique();
 
@@ -405,7 +385,7 @@ mod tests {
     async fn test_validate_account_type_validation_failure() {
         let _m = ConfigMockBuilder::new().with_cache_enabled(false).build_and_setup();
 
-        let account = create_mock_account_with_owner(Pubkey::new_unique()); // Wrong owner for system
+        let account = create_mock_account_with_owner(Pubkey::new_unique());
         let rpc_client = create_mock_rpc_client_with_account(&account);
         let account_pubkey = Pubkey::new_unique();
 

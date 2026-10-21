@@ -24,7 +24,7 @@ jobs:
     steps:
       - name: Resolve PR context
         id: pr
-        uses: actions/github-script@v9
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
             const prNumber = Number("${{ inputs.pr_number }}");
@@ -57,28 +57,28 @@ jobs:
           exit 1
 
       - name: Checkout PR merge ref
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ steps.pr.outputs.merge_ref }}
 
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
-          shared-key: "rust-integration-fork-live-manual"
+          toolchain: nightly-2026-07-13
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: "rust-dev"
+          save-if: false
 
       - name: Install just
-        uses: extractions/setup-just@v4
+        uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
         with:
           just-version: "1.50.0"
 
       - name: Build workspace
         run: just build
 
-      - name: Setup Solana CLI
-        uses: ./.github/actions/setup-solana
-
-      - uses: dopplerhq/secrets-fetch-action@v2.0.0
+      - uses: dopplerhq/secrets-fetch-action@451892f16195f9ac360e1a5bcbf0b5fd0e957534 # v2.0.0
         with:
           auth-method: oidc
           doppler-identity-id: ${{ vars.DOPPLER_SERVICE_IDENTITY_ID }}
@@ -94,23 +94,16 @@ jobs:
           fi
 
       - name: Run external live tests
-        uses: ./.github/actions/run-test-runner
-        with:
-          filters: "--filter external_live"
+        run: cargo test -p tests --test external
 
       - name: Cleanup test environment
         if: always()
         uses: ./.github/actions/cleanup-test-env
 
-      - name: Show failure logs
-        if: failure()
-        uses: ./.github/actions/show-failure-logs
-        with:
-          test-type: "Rust integration (fork external live)"
 
       - name: Verify PR head is unchanged
         if: success()
-        uses: actions/github-script@v9
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
             const prNumber = Number("${{ steps.pr.outputs.pr_number }}");
@@ -130,7 +123,7 @@ jobs:
 
       - name: Record fork live approval marker
         if: success()
-        uses: actions/github-script@v9
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
             const prNumber = Number("${{ steps.pr.outputs.pr_number }}");
@@ -147,7 +140,7 @@ jobs:
 
       - name: Rerun fork live gate
         if: success()
-        uses: actions/github-script@v9
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
             const headSha = "${{ steps.pr.outputs.head_sha }}";

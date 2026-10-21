@@ -1,11 +1,9 @@
 use std::collections::HashMap;
 
+use solana_nullable::MaybeNull;
 use solana_program::program_pack::Pack;
 use solana_sdk::{account::Account, program_option::COption, pubkey::Pubkey};
-use spl_pod::{
-    optional_keys::OptionalNonZeroPubkey,
-    primitives::{PodU16, PodU64},
-};
+use spl_pod::primitives::{PodU16, PodU64};
 use spl_token_2022_interface::{
     extension::{
         self,
@@ -24,7 +22,6 @@ use crate::token::{
     spl_token_2022_util::ParsedExtension,
 };
 
-// Common default values used across mock builders
 const DEFAULT_LAMPORTS: u64 = 1_000_000;
 const DEFAULT_TOKEN_AMOUNT: u64 = 100;
 const DEFAULT_MINT_SUPPLY: u64 = 1_000_000_000_000;
@@ -79,11 +76,6 @@ impl AccountMockBuilder {
 
     pub fn with_executable(mut self, executable: bool) -> Self {
         self.executable = executable;
-        self
-    }
-
-    pub fn with_rent_epoch(mut self, rent_epoch: u64) -> Self {
-        self.rent_epoch = rent_epoch;
         self
     }
 
@@ -166,15 +158,6 @@ impl TokenAccountMockBuilder {
     /// Set native amount for SPL Token
     pub fn with_native_spl(mut self, native_amount: Option<u64>) -> Self {
         self.is_native_spl = match native_amount {
-            Some(amount) => COption::Some(amount),
-            None => COption::None,
-        };
-        self
-    }
-
-    /// Set native amount for Token2022
-    pub fn with_native_token2022(mut self, native_amount: Option<u64>) -> Self {
-        self.is_native_token2022 = match native_amount {
             Some(amount) => COption::Some(amount),
             None => COption::None,
         };
@@ -485,13 +468,20 @@ impl MintAccountMockBuilder {
                             true,
                         )?;
                     }
+                    ExtensionType::PermissionedBurn => {
+                        state
+                            .init_extension::<extension::permissioned_burn::PermissionedBurnConfig>(
+                                true,
+                            )?;
+                    }
                     ExtensionType::TransferHook => {
                         let transfer_hook =
                             state.init_extension::<extension::transfer_hook::TransferHook>(true)?;
-                        transfer_hook.authority =
-                            OptionalNonZeroPubkey::try_from(self.transfer_hook_authority)?;
+                        transfer_hook.authority = MaybeNull::try_from(self.transfer_hook_authority)
+                            .map_err(|e| e.to_string())?;
                         transfer_hook.program_id =
-                            OptionalNonZeroPubkey::try_from(self.transfer_hook_program_id)?;
+                            MaybeNull::try_from(self.transfer_hook_program_id)
+                                .map_err(|e| e.to_string())?;
                     }
                     // Add other extension types as needed
                     _ => {}
@@ -537,8 +527,6 @@ impl MintAccountMockBuilder {
     }
 }
 
-// Helper functions for test account creation
-
 pub fn create_mock_account() -> Account {
     AccountMockBuilder::new().build()
 }
@@ -575,31 +563,6 @@ pub fn create_mock_account_with_owner(owner: Pubkey) -> Account {
     AccountMockBuilder::new().with_owner(owner).build()
 }
 
-pub fn create_mock_usdc_mint_account() -> Account {
-    MintAccountMockBuilder::new()
-        .with_decimals(6)
-        .with_supply(DEFAULT_MINT_SUPPLY) // 1M USDC with 6 decimals
-        .build()
-}
-
-/// Create mock SOL wrapped token mint (9 decimals)
-pub fn create_mock_wsol_mint_account() -> Account {
-    MintAccountMockBuilder::new().with_decimals(9).build()
-}
-
-/// Create mock Token2022 account with specific extensions
-pub fn create_mock_token2022_account_with_extensions(
-    owner: &Pubkey,
-    mint: &Pubkey,
-    extensions: Vec<ExtensionType>,
-) -> Account {
-    TokenAccountMockBuilder::new()
-        .with_owner(owner)
-        .with_mint(mint)
-        .with_extensions(extensions)
-        .build_token2022()
-}
-
 /// Create mock Token2022 mint with specific extensions
 pub fn create_mock_token2022_mint_with_extensions(
     decimals: u8,
@@ -611,16 +574,14 @@ pub fn create_mock_token2022_mint_with_extensions(
         .build_token2022()
 }
 
-// ========== Token2022 Test Helpers ==========
-
 /// Helper to create Transfer Fee Config for testing
 pub fn create_transfer_fee_config(basis_points: u16, max_fee: u64) -> TransferFeeConfig {
     TransferFeeConfig {
-        transfer_fee_config_authority: OptionalNonZeroPubkey::try_from(Some(
+        transfer_fee_config_authority: MaybeNull::try_from(Some(
             spl_pod::solana_pubkey::Pubkey::new_unique(),
         ))
         .unwrap(),
-        withdraw_withheld_authority: OptionalNonZeroPubkey::try_from(Some(
+        withdraw_withheld_authority: MaybeNull::try_from(Some(
             spl_pod::solana_pubkey::Pubkey::new_unique(),
         ))
         .unwrap(),

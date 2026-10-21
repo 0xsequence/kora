@@ -5,14 +5,10 @@ use jsonrpsee::rpc_params;
 use kora_lib::transaction::TransactionUtil;
 use solana_sdk::{pubkey::Pubkey, signature::Signer};
 
-// **************************************************************************************
-// Token 2022 Transfer Tests
-// **************************************************************************************
-
 /// Test transferTransaction with Token 2022 transfer (DEPRECATED endpoint)
 #[tokio::test]
 async fn test_transfer_transaction_token_2022_legacy() {
-    let ctx = TestContext::new().await.expect("Failed to create test context");
+    let ctx = crate::ctx().await;
 
     let sender = SenderTestHelper::get_test_sender_keypair();
     let recipient = RecipientTestHelper::get_recipient_pubkey();
@@ -41,10 +37,9 @@ async fn test_transfer_transaction_token_2022_legacy() {
 }
 
 /// Test Token 2022 transfer transaction returns valid unsigned transaction (DEPRECATED endpoint)
-/// Note: ATA creation for destination is handled automatically by Kora
 #[tokio::test]
 async fn test_transfer_transaction_token_2022_with_ata_legacy() {
-    let ctx = TestContext::new().await.expect("Failed to create test context");
+    let ctx = crate::ctx().await;
 
     let sender = SenderTestHelper::get_test_sender_keypair();
     let recipient = RecipientTestHelper::get_recipient_pubkey();
@@ -68,19 +63,14 @@ async fn test_transfer_transaction_token_2022_with_ata_legacy() {
     assert!(response["blockhash"].as_str().is_some(), "Expected blockhash in response");
     assert!(response["signer_pubkey"].as_str().is_some(), "Expected signer_pubkey in response");
 
-    // Verify we can decode the unsigned transaction
     let transaction_string = response["transaction"].as_str().unwrap();
     let _transaction = TransactionUtil::decode_b64_transaction(transaction_string)
         .expect("Failed to decode transaction from base64");
 }
 
-// **************************************************************************************
-// Token 2022 Sign Transaction Tests
-// **************************************************************************************
-
 #[tokio::test]
 async fn test_sign_token_2022_transaction_legacy() {
-    let ctx = TestContext::new().await.expect("Failed to create test context");
+    let ctx = crate::ctx().await;
     let sender = SenderTestHelper::get_test_sender_keypair();
     let recipient = RecipientTestHelper::get_recipient_pubkey();
     let fee_payer = FeePayerTestHelper::get_fee_payer_pubkey();
@@ -127,7 +117,7 @@ async fn test_sign_token_2022_transaction_legacy() {
 
 #[tokio::test]
 async fn test_sign_token_2022_transaction_v0() {
-    let ctx = TestContext::new().await.expect("Failed to create test context");
+    let ctx = crate::ctx().await;
     let sender = SenderTestHelper::get_test_sender_keypair();
     let recipient = RecipientTestHelper::get_recipient_pubkey();
     let fee_payer = FeePayerTestHelper::get_fee_payer_pubkey();
@@ -175,7 +165,7 @@ async fn test_sign_token_2022_transaction_v0() {
 
 #[tokio::test]
 async fn test_sign_token_2022_transaction_v0_with_lookup() {
-    let ctx = TestContext::new().await.expect("Failed to create test context");
+    let ctx = crate::ctx().await;
     let sender = SenderTestHelper::get_test_sender_keypair();
     let recipient = RecipientTestHelper::get_recipient_pubkey();
     let fee_payer = FeePayerTestHelper::get_fee_payer_pubkey();
@@ -240,7 +230,7 @@ async fn test_sign_and_send_token_2022_transaction_legacy() {
     let token_mint = USDCMintTestHelper::get_test_usdc_mint_pubkey();
     let token_mint_2022 = USDCMint2022TestHelper::get_test_usdc_mint_2022_pubkey();
 
-    let ctx = TestContext::new().await.expect("Failed to create test context");
+    let ctx = crate::ctx().await;
 
     let test_tx = ctx
         .transaction_builder()
@@ -277,7 +267,7 @@ async fn test_sign_and_send_token_2022_transaction_v0() {
     let token_mint = USDCMintTestHelper::get_test_usdc_mint_pubkey();
     let token_mint_2022 = USDCMint2022TestHelper::get_test_usdc_mint_2022_pubkey();
 
-    let ctx = TestContext::new().await.expect("Failed to create test context");
+    let ctx = crate::ctx().await;
 
     let test_tx = ctx
         .v0_transaction_builder()
@@ -315,7 +305,7 @@ async fn test_sign_and_send_token_2022_transaction_v0_with_lookup() {
     let token_mint = USDCMintTestHelper::get_test_usdc_mint_pubkey();
     let token_mint_2022 = USDCMint2022TestHelper::get_test_usdc_mint_2022_pubkey();
 
-    let ctx = TestContext::new().await.expect("Failed to create test context");
+    let ctx = crate::ctx().await;
 
     // Use the transaction lookup table which contains the mint address and the spl token program used for ATA derivation
     let transaction_lookup_table = LookupTableHelper::get_transaction_lookup_table_address()
@@ -359,7 +349,7 @@ async fn test_sign_and_send_token_2022_transaction_v0_with_lookup() {
 /// Test Token 2022 sign transaction if paid with fee payer pool logic
 #[tokio::test]
 async fn test_sign_token_2022_transaction_if_paid_legacy() {
-    let ctx = TestContext::new().await.expect("Failed to create test context");
+    let ctx = crate::ctx().await;
 
     let rpc_client = ctx.rpc_client();
 
@@ -423,7 +413,7 @@ async fn test_sign_token_2022_transaction_if_paid_legacy() {
 /// Test Token 2022 sign transaction if paid with V0 transaction
 #[tokio::test]
 async fn test_sign_token_2022_transaction_if_paid_v0() {
-    let ctx = TestContext::new().await.expect("Failed to create test context");
+    let ctx = crate::ctx().await;
 
     let rpc_client = ctx.rpc_client();
 
@@ -486,7 +476,7 @@ async fn test_sign_token_2022_transaction_if_paid_v0() {
 /// Test Token 2022 sign transaction if paid with V0 transaction and lookup table
 #[tokio::test]
 async fn test_sign_token_2022_transaction_if_paid_v0_with_lookup() {
-    let ctx = TestContext::new().await.expect("Failed to create test context");
+    let ctx = crate::ctx().await;
 
     let rpc_client = ctx.rpc_client();
 

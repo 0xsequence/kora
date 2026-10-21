@@ -116,15 +116,12 @@ where
         Box::pin(async move {
             let (parts, body_bytes) = extract_parts_and_body_bytes(request).await;
 
-            match verify_jsonrpc_method(&body_bytes, &allowed_methods) {
-                Ok(_) => {}
-                Err(_) => {
-                    return Ok(build_response_with_graceful_error(
-                        None,
-                        StatusCode::METHOD_NOT_ALLOWED,
-                        "",
-                    ));
-                }
+            if verify_jsonrpc_method(&body_bytes, &allowed_methods).is_err() {
+                return Ok(build_response_with_graceful_error(
+                    None,
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "",
+                ));
             }
 
             let new_body = Body::from(body_bytes);
@@ -144,7 +141,6 @@ mod tests {
     };
     use tower::{Layer, Service, ServiceExt};
 
-    // Mock service that always returns OK
     #[derive(Clone)]
     struct MockService;
 
@@ -215,7 +211,6 @@ mod tests {
         let layer = MethodValidationLayer::new(allowed_methods);
         let mut service = layer.layer(MockService);
 
-        // Test each allowed method
         for method in &["liveness", "getConfig", "signTransaction", "estimateTransactionFee"] {
             let body = format!(r#"{{"jsonrpc":"2.0","method":"{}","id":1}}"#, method);
             let request = Request::builder()

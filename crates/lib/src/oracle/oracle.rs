@@ -2,6 +2,7 @@ use crate::{
     error::KoraError,
     oracle::{jupiter::JupiterPriceOracle, utils::OracleUtil},
 };
+#[cfg(test)]
 use mockall::automock;
 use reqwest::Client;
 use rust_decimal::Decimal;
@@ -36,7 +37,7 @@ impl PriceSource {
     }
 }
 
-#[automock]
+#[cfg_attr(test, automock)]
 #[async_trait::async_trait]
 pub trait PriceOracle {
     async fn get_price(&self, client: &Client, mint_address: &str)
@@ -155,7 +156,6 @@ mod tests {
     #[tokio::test]
     async fn test_price_oracle_empty_mints() {
         let mut mock_oracle = MockPriceOracle::new();
-        // Expect zero calls — empty mints should short-circuit
         mock_oracle.expect_get_prices().times(0);
 
         let oracle = RetryingPriceOracle::new(3, Duration::from_millis(10), Arc::new(mock_oracle));
@@ -209,8 +209,6 @@ mod tests {
     #[tokio::test]
     async fn test_get_token_price_not_found() {
         let mut mock_oracle = MockPriceOracle::new();
-        // Return Ok with an empty HashMap — the queried mint won't be in it
-        // get_prices returns Ok immediately so retry loop exits after 1 attempt (no retries triggered)
         mock_oracle.expect_get_prices().times(1).returning(|_, _| Ok(HashMap::new()));
 
         let oracle = RetryingPriceOracle::new(3, Duration::from_millis(10), Arc::new(mock_oracle));

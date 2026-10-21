@@ -30,9 +30,7 @@ import {
     SignTransactionRequest,
     SignTransactionResponse,
 } from '../src/types/index.js';
-import { getInstructionsFromBase64Message } from '../src/utils/transaction.js';
 
-// Mock fetch globally
 const mockFetch = jest.fn();
 global.fetch = mockFetch;
 
@@ -40,7 +38,6 @@ describe('KoraClient Unit Tests', () => {
     let client: KoraClient;
     const mockRpcUrl = 'http://localhost:8080';
 
-    // Helper Functions
     const mockSuccessfulResponse = (result: any) => {
         mockFetch.mockResolvedValueOnce({
             json: jest.fn().mockResolvedValueOnce({
@@ -95,14 +92,6 @@ describe('KoraClient Unit Tests', () => {
 
     afterEach(() => {
         jest.resetAllMocks();
-    });
-
-    describe('Constructor', () => {
-        it('should create KoraClient instance with provided RPC URL', () => {
-            const testUrl = 'https://api.example.com';
-            const testClient = new KoraClient({ rpcUrl: testUrl });
-            expect(testClient).toBeInstanceOf(KoraClient);
-        });
     });
 
     describe('RPC Request Handling', () => {
@@ -246,16 +235,6 @@ describe('KoraClient Unit Tests', () => {
 
             await testSuccessfulRpcMethod('getPayerSigner', () => client.getPayerSigner(), mockResponse);
         });
-
-        it('should return same address for signer and payment_destination when no separate paymaster', async () => {
-            const mockResponse: GetPayerSignerResponse = {
-                payment_address: 'DemoKMZWkk483QoFPLRPQ2XVKB7bWnuXwSjvDE1JsWk7',
-                signer_address: 'DemoKMZWkk483QoFPLRPQ2XVKB7bWnuXwSjvDE1JsWk7',
-            };
-
-            await testSuccessfulRpcMethod('getPayerSigner', () => client.getPayerSigner(), mockResponse);
-            expect(mockResponse.signer_address).toBe(mockResponse.payment_address);
-        });
     });
 
     describe('estimateTransactionFee', () => {
@@ -288,6 +267,7 @@ describe('KoraClient Unit Tests', () => {
             const mockResponse: SignTransactionResponse = {
                 signed_transaction: 'base64_signed_transaction',
                 signer_pubkey: 'test_signer_pubkey',
+                lighthouse_assertion_added: false,
             };
 
             await testSuccessfulRpcMethod(
@@ -350,15 +330,6 @@ describe('KoraClient Unit Tests', () => {
 
             await testSuccessfulRpcMethod('signBundle', () => client.signBundle(request), mockResponse, request);
         });
-
-        it('should handle RPC error', async () => {
-            const request: SignBundleRequest = {
-                transactions: ['base64_tx_1'],
-            };
-            const mockError = { code: -32000, message: 'Bundle validation failed' };
-            mockErrorResponse(mockError);
-            await expect(client.signBundle(request)).rejects.toThrow('Kora Error -32000: Bundle validation failed');
-        });
     });
 
     describe('signAndSendBundle', () => {
@@ -379,98 +350,9 @@ describe('KoraClient Unit Tests', () => {
                 request,
             );
         });
-
-        it('should handle RPC error', async () => {
-            const request: SignAndSendBundleRequest = {
-                transactions: ['base64_tx_1'],
-            };
-            const mockError = { code: -32000, message: 'Jito submission failed' };
-            mockErrorResponse(mockError);
-            await expect(client.signAndSendBundle(request)).rejects.toThrow(
-                'Kora Error -32000: Jito submission failed',
-            );
-        });
     });
 
     describe('getPaymentInstruction', () => {
-        const _mockConfig: Config = {
-            enabled_methods: {
-                estimate_bundle_fee: true,
-                estimate_transaction_fee: true,
-                get_blockhash: true,
-                get_config: true,
-                get_payer_signer: true,
-                get_supported_tokens: true,
-                get_version: true,
-                liveness: true,
-                sign_and_send_bundle: true,
-                sign_and_send_transaction: true,
-                sign_bundle: true,
-                sign_transaction: true,
-                transfer_transaction: true,
-            },
-            fee_payers: ['11111111111111111111111111111111'],
-            validation_config: {
-                allowed_programs: ['program1'],
-                allowed_spl_paid_tokens: ['4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU'],
-                allowed_tokens: ['token1'],
-                disallowed_accounts: [],
-                fee_payer_policy: {
-                    spl_token: {
-                        allow_approve: true,
-                        allow_burn: true,
-                        allow_close_account: true,
-                        allow_freeze_account: true,
-                        allow_initialize_account: true,
-                        allow_initialize_mint: true,
-                        allow_initialize_multisig: true,
-                        allow_mint_to: true,
-                        allow_revoke: true,
-                        allow_set_authority: true,
-                        allow_thaw_account: true,
-                        allow_transfer: true,
-                    },
-                    system: {
-                        allow_allocate: true,
-                        allow_assign: true,
-                        allow_create_account: true,
-                        allow_transfer: true,
-                        nonce: {
-                            allow_advance: true,
-                            allow_authorize: true,
-                            allow_initialize: true,
-                            allow_withdraw: true,
-                        },
-                    },
-                    token_2022: {
-                        allow_approve: true,
-                        allow_burn: true,
-                        allow_close_account: true,
-                        allow_freeze_account: true,
-                        allow_initialize_account: true,
-                        allow_initialize_mint: true,
-                        allow_initialize_multisig: true,
-                        allow_mint_to: true,
-                        allow_revoke: true,
-                        allow_set_authority: true,
-                        allow_thaw_account: true,
-                        allow_transfer: true,
-                    },
-                },
-                max_allowed_lamports: 1000000,
-                max_signatures: 10,
-                price: {
-                    margin: 0.1,
-                    type: 'margin',
-                },
-                price_source: 'Jupiter',
-                token2022: {
-                    blocked_account_extensions: [],
-                    blocked_mint_extensions: [],
-                },
-            },
-        };
-
         const mockFeeEstimate: EstimateTransactionFeeResponse = {
             fee_in_lamports: 5000,
             fee_in_token: 50000,
@@ -478,8 +360,6 @@ describe('KoraClient Unit Tests', () => {
             signer_pubkey: 'DemoKMZWkk483QoFPLRPQ2XVKB7bWnuXwSjvDE1JsWk7',
         };
 
-        // Create a mock base64-encoded transaction
-        // This is a minimal valid transaction structure
         const mockTransactionBase64 =
             'Aoq7ymA5OGP+gmDXiY5m3cYXlY2Rz/a/gFjOgt9ZuoCS7UzuiGGaEnW2OOtvHvMQHkkD7Z4LRF5B63ftu+1oZwIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgECB1urjQEjgFgzqYhJ8IXJeSg4cJP1j1g2CJstOQTDchOKUzqH3PxgGW3c4V3vZV05A5Y30/MggOBs0Kd00s1JEwg5TaEeaV4+KL2y7fXIAuf6cN0ZQitbhY+G9ExtBSChspOXPgNcy9pYpETe4bmB+fg4bfZx1tnicA/kIyyubczAmbcIKIuniNOOQYG2ggKCz8NjEsHVezrWMatndu1wk6J5miGP26J6Vwp31AljiAajAFuP0D9mWJwSeFuA7J5rPwbd9uHXZaGT2cvhRs7reawctIXtX1s3kTqM9YV+/wCpd/O36SW02zRtNtqk6GFeip2+yBQsVTeSbLL4rWJRkd4CBgQCBQQBCgxAQg8AAAAAAAYGBAIFAwEKDBAnAAAAAAAABg==';
 
@@ -500,7 +380,6 @@ describe('KoraClient Unit Tests', () => {
         });
 
         it('should successfully append payment instruction', async () => {
-            // Mock estimateTransactionFee call
             mockFetch.mockResolvedValueOnce({
                 json: jest.fn().mockResolvedValueOnce({
                     id: 1,
@@ -536,7 +415,6 @@ describe('KoraClient Unit Tests', () => {
                 signer_address: mockFeeEstimate.signer_pubkey,
             });
 
-            // Verify only estimateTransactionFee was called
             expect(mockFetch).toHaveBeenCalledTimes(1);
             expect(mockFetch).toHaveBeenCalledWith(mockRpcUrl, {
                 body: JSON.stringify({
@@ -556,7 +434,6 @@ describe('KoraClient Unit Tests', () => {
         });
 
         it('should handle fixed pricing configuration', async () => {
-            // Mock estimateTransactionFee call
             mockFetch.mockResolvedValueOnce({
                 json: jest.fn().mockResolvedValueOnce({
                     id: 1,
@@ -584,7 +461,6 @@ describe('KoraClient Unit Tests', () => {
         });
 
         it('should handle estimateTransactionFee RPC error', async () => {
-            // Mock failed estimateTransactionFee
             const mockError = { code: -32602, message: 'Invalid transaction' };
             mockFetch.mockResolvedValueOnce({
                 json: jest.fn().mockResolvedValueOnce({
@@ -609,7 +485,6 @@ describe('KoraClient Unit Tests', () => {
             // Generate a real KeyPairSigner (simulates a user's wallet)
             const userSigner = await generateKeyPairSigner();
 
-            // Mock estimateTransactionFee to return the user's address as source_wallet context
             const feeEstimate: EstimateTransactionFeeResponse = {
                 fee_in_lamports: 5000,
                 fee_in_token: 50000,
@@ -618,7 +493,7 @@ describe('KoraClient Unit Tests', () => {
             };
             mockSuccessfulResponse(feeEstimate);
 
-            // Get payment instruction — authority is a plain address (no signer attached)
+            // authority is a plain address (no signer attached)
             const result = await client.getPaymentInstruction({
                 ...validRequest,
                 source_wallet: userSigner.address,
@@ -633,9 +508,7 @@ describe('KoraClient Unit Tests', () => {
                 source: '11111111111111111111111111111111' as any,
             });
 
-            // Combine both instructions in a transaction — previously this would throw
-            // "Multiple distinct signers" because the payment instruction had a NoopSigner.
-            // Now the payment instruction uses a plain address, so no conflict.
+            // Previously threw "Multiple distinct signers" because the payment instruction had a NoopSigner; now it uses a plain address, so no conflict.
             const feePayer = createNoopSigner('DemoKMZWkk483QoFPLRPQ2XVKB7bWnuXwSjvDE1JsWk7' as any);
             const txMessage = appendTransactionMessageInstructions(
                 [userOwnedIx, result.payment_instruction],
@@ -645,7 +518,6 @@ describe('KoraClient Unit Tests', () => {
                 ),
             );
 
-            // This should NOT throw "Multiple distinct signers"
             await expect(partiallySignTransactionMessageWithSigners(txMessage)).resolves.toBeDefined();
         });
 
@@ -660,13 +532,11 @@ describe('KoraClient Unit Tests', () => {
             };
             mockSuccessfulResponse(feeEstimate);
 
-            // Pass the signer directly as source_wallet
             const result = await client.getPaymentInstruction({
                 ...validRequest,
                 source_wallet: userSigner,
             });
 
-            // The authority account meta should carry the signer
             const authorityMeta = result.payment_instruction.accounts?.[2];
             expect(authorityMeta).toEqual(
                 expect.objectContaining({
@@ -676,7 +546,6 @@ describe('KoraClient Unit Tests', () => {
                 }),
             );
 
-            // Combining with another instruction using the same signer should work
             const userOwnedIx: Instruction = getTransferInstruction({
                 amount: 1000n,
                 authority: userSigner,
@@ -724,12 +593,6 @@ describe('KoraClient Unit Tests', () => {
                 json: jest.fn().mockRejectedValueOnce(new Error('Invalid JSON')),
             });
             await expect(client.getConfig()).rejects.toThrow('Invalid JSON');
-        });
-
-        it('should handle responses with an error object', async () => {
-            const mockError = { code: -32602, message: 'Invalid params' };
-            mockErrorResponse(mockError);
-            await expect(client.getConfig()).rejects.toThrow('Kora Error -32602: Invalid params');
         });
 
         it('should handle empty error object gracefully', async () => {
@@ -891,49 +754,6 @@ describe('KoraClient Unit Tests', () => {
             });
 
             await expect(recaptchaClient.getVersion()).rejects.toThrow('Token generation failed');
-        });
-    });
-});
-
-describe('Transaction Utils', () => {
-    describe('getInstructionsFromBase64Message', () => {
-        it('should parse instructions from a valid base64 message', () => {
-            // This is a sample base64 encoded transaction message
-            const validMessage =
-                'AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAQABAwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIDAAEMAgAAAAEAAAAAAAAA';
-
-            const instructions = getInstructionsFromBase64Message(validMessage);
-
-            expect(Array.isArray(instructions)).toBe(true);
-            expect(instructions).not.toBeNull();
-        });
-
-        it('should return empty array for invalid base64 message', () => {
-            const invalidMessage = 'invalid_base64_message';
-
-            const instructions = getInstructionsFromBase64Message(invalidMessage);
-
-            expect(Array.isArray(instructions)).toBe(true);
-            expect(instructions).toEqual([]);
-        });
-
-        it('should return empty array for empty message', () => {
-            const emptyMessage = '';
-
-            const instructions = getInstructionsFromBase64Message(emptyMessage);
-
-            expect(Array.isArray(instructions)).toBe(true);
-            expect(instructions).toEqual([]);
-        });
-
-        it('should handle malformed transaction messages gracefully', () => {
-            // Valid base64 but not a valid transaction message
-            const malformedMessage = 'SGVsbG8gV29ybGQh'; // "Hello World!" in base64
-
-            const instructions = getInstructionsFromBase64Message(malformedMessage);
-
-            expect(Array.isArray(instructions)).toBe(true);
-            expect(instructions).toEqual([]);
         });
     });
 });

@@ -1,5 +1,6 @@
 use crate::{
     bundle::{BundleError, BundleProcessingMode, BundleProcessor, JitoError},
+    config::Config,
     plugin::PluginExecutionContext,
     rpc_server::middleware_utils::default_sig_verify,
     transaction::TransactionUtil,
@@ -9,6 +10,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_keychain::SolanaSigner;
+use solana_sdk::pubkey::Pubkey;
 use std::sync::Arc;
 use utoipa::ToSchema;
 
@@ -50,18 +52,29 @@ pub async fn sign_bundle(
     rpc_client: &Arc<RpcClient>,
     request: SignBundleRequest,
 ) -> Result<SignBundleResponse, KoraError> {
+    let config = &get_config()?;
+    let (signed_transactions, fee_payer) =
+        sign_bundle_transactions(rpc_client, config, request, PluginExecutionContext::SignBundle)
+            .await?;
+
+    Ok(SignBundleResponse { signed_transactions, signer_pubkey: fee_payer.to_string() })
+}
+
+pub(super) async fn sign_bundle_transactions(
+    rpc_client: &Arc<RpcClient>,
+    config: &Config,
+    request: SignBundleRequest,
+    plugin_context: PluginExecutionContext,
+) -> Result<(Vec<String>, Pubkey), KoraError> {
     let SignBundleRequest { transactions, signer_key, sig_verify, user_id, sign_only_indices } =
         request;
-    let config = &get_config()?;
 
     if !config.kora.bundle.enabled {
         return Err(BundleError::Jito(JitoError::NotEnabled).into());
     }
 
-    // Validate bundle size on ALL transactions first
     BundleValidator::validate_jito_bundle_size(&transactions)?;
 
-    // Extract only the transactions we need to process
     let (transactions_to_process, index_to_position) =
         BundleProcessor::extract_transactions_to_process(&transactions, sign_only_indices.clone())?;
 
@@ -77,7 +90,7 @@ pub async fn sign_bundle(
         config,
         rpc_client,
         sig_verify,
-        Some(PluginExecutionContext::SignBundle),
+        Some(plugin_context),
         BundleProcessingMode::CheckUsage(user_id.as_deref()),
     )
     .await?;
@@ -102,16 +115,15 @@ pub async fn sign_bundle(
         .await?;
     }
 
+    let will_send = matches!(plugin_context, PluginExecutionContext::SignAndSendBundle);
     let signed_resolved =
-        processor.sign_all(&signer, &fee_payer, rpc_client, config, false).await?;
+        processor.sign_all(&signer, &fee_payer, rpc_client, config, will_send).await?;
 
-    // Encode signed transactions
     let encoded_signed: Vec<String> = signed_resolved
         .iter()
         .map(|r| TransactionUtil::encode_versioned_transaction(&r.transaction))
         .collect::<Result<Vec<_>, _>>()?;
 
-    // Merge signed transactions back into original positions
     let signed_transactions = BundleProcessor::merge_signed_transactions(
         &transactions,
         encoded_signed,
@@ -131,7 +143,7 @@ pub async fn sign_bundle(
         .await?;
     }
 
-    Ok(SignBundleResponse { signed_transactions, signer_pubkey: fee_payer.to_string() })
+    Ok((signed_transactions, fee_payer))
 }
 
 #[cfg(test)]
@@ -144,6 +156,7 @@ mod tests {
             config_mock::{
                 mock_state::setup_config_mock, ConfigMockBuilder, ValidationConfigBuilder,
             },
+            transaction_mock::create_mock_encoded_transaction,
         },
         transaction::TransactionUtil,
     };
@@ -152,6 +165,7 @@ mod tests {
     use solana_message::{Message, VersionedMessage};
     use solana_sdk::pubkey::Pubkey;
     use solana_system_interface::instruction::transfer;
+    use solana_transaction::versioned::TransactionVersion;
 
     #[tokio::test]
     async fn test_sign_bundle_empty_bundle() {
@@ -269,8 +283,6 @@ mod tests {
                 .build(),
         );
 
-        // Create transactions with signer as fee payer
-
         let transactions: Vec<String> = (0..5)
             .map(|_| {
                 let ix = transfer(&Pubkey::new_unique(), &Pubkey::new_unique(), 1000000000);
@@ -280,7 +292,6 @@ mod tests {
             })
             .collect();
 
-        // Use signer_key to ensure consistency - prevents race conditions with parallel tests
         let request = SignBundleRequest {
             transactions,
             signer_key: Some(signer_pubkey.to_string()),
@@ -319,13 +330,11 @@ mod tests {
                 .build(),
         );
 
-        // Create transaction with signer as fee payer
         let ix = transfer(&Pubkey::new_unique(), &Pubkey::new_unique(), 1000000000);
         let message = VersionedMessage::Legacy(Message::new(&[ix], Some(&signer_pubkey)));
         let transaction = TransactionUtil::new_unsigned_versioned_transaction(message);
         let encoded_tx = TransactionUtil::encode_versioned_transaction(&transaction).unwrap();
 
-        // Single transaction bundle is valid
         let request = SignBundleRequest {
             transactions: vec![encoded_tx],
             signer_key: Some(signer_pubkey.to_string()),
@@ -344,7 +353,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_sign_bundle_sig_verify_default() {
-        // Test that sig_verify defaults correctly via serde (defaults to false)
         let json = r#"{"transactions": ["tx1"]}"#;
         let request: SignBundleRequest = serde_json::from_str(json).unwrap();
 
@@ -512,5 +520,32 @@ mod tests {
         let err = result.unwrap_err().to_string();
         assert!(err.contains("Total transfer amount"), "Unexpected error: {err}");
         assert!(err.contains("exceeds maximum allowed"), "Unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_sign_bundle_rejects_disallowed_transaction_version() {
+        let _m = ConfigMockBuilder::new()
+            .with_bundle_enabled(true)
+            .with_allowed_transaction_versions(vec![TransactionVersion::Number(0)])
+            .build_and_setup();
+        let _ = setup_or_get_test_signer();
+        let _ = setup_or_get_test_usage_limiter().await;
+
+        let rpc_client = Arc::new(RpcMockBuilder::new().with_simulation().build());
+
+        let request = SignBundleRequest {
+            transactions: vec![create_mock_encoded_transaction()],
+            signer_key: None,
+            sig_verify: false,
+            user_id: None,
+            sign_only_indices: None,
+        };
+
+        let result = sign_bundle(&rpc_client, request).await;
+
+        assert_eq!(
+            result.unwrap_err(),
+            KoraError::InvalidTransaction("Transaction version is not allowed".to_string())
+        );
     }
 }

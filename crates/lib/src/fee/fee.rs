@@ -1,7 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-    str::FromStr,
-};
+use std::str::FromStr;
 
 use crate::{
     config::Config,
@@ -12,13 +9,11 @@ use crate::{
         interface::TokenInterface,
         spl_token::TokenProgram,
         spl_token_2022::{Token2022Mint, Token2022Program},
-        token::{AtaCreationInstructionInfo, TokenType, TokenUtil, TransferHookValidationFlow},
+        token::{TokenType, TokenUtil, TransferHookValidationFlow},
     },
     transaction::{
-        ParsedALTInstructionData, ParsedALTInstructionType,
-        ParsedBpfLoaderUpgradeableInstructionData, ParsedBpfLoaderUpgradeableInstructionType,
-        ParsedSPLInstructionData, ParsedSPLInstructionType, ParsedSystemInstructionData,
-        ParsedSystemInstructionType, VersionedTransactionOps, VersionedTransactionResolved,
+        ParsedSPLInstructionData, ParsedSPLInstructionType, VersionedTransactionOps,
+        VersionedTransactionResolved,
     },
 };
 use solana_sdk::instruction::Instruction;
@@ -29,10 +24,15 @@ use crate::cache::CacheUtil;
 #[cfg(test)]
 use crate::tests::cache_mock::MockCacheUtil as CacheUtil;
 use solana_client::{nonblocking::rpc_client::RpcClient, rpc_client::SerializableMessage};
+use solana_compute_budget::compute_budget_limits::{
+    ComputeBudgetLimits, DEFAULT_INSTRUCTION_COMPUTE_UNIT_LIMIT, MAX_COMPUTE_UNIT_LIMIT,
+};
+use solana_compute_budget_interface::ComputeBudgetInstruction;
 use solana_message::VersionedMessage;
-use solana_program_pack::Pack;
 use solana_sdk::pubkey::Pubkey;
-use spl_token_2022_interface::{extension::ExtensionType, state::Account as Token2022Account};
+
+mod outflow;
+
 #[derive(Debug, Clone)]
 pub struct TotalFeeCalculation {
     pub total_fee_lamports: u64,
@@ -152,7 +152,6 @@ impl FeeConfigUtil {
                 if destination_owner == Some(payment_destination) {
                     has_payment = true;
 
-                    // Calculate Token2022 transfer fees if applicable
                     if *is_2022 {
                         if let Some(mint_pubkey) = mint {
                             let mint_account =
@@ -207,21 +206,16 @@ impl FeeConfigUtil {
         let base_fee =
             TransactionFeeUtil::get_estimate_fee_resolved(rpc_client, transaction).await?;
 
-        // Priority fees are now included in the calculate done by the RPC getFeeForMessage
-        // ATA and Token account creation fees are captured in the calculate fee payer outflow (System Transfer)
-
-        // If the Kora signer is not inclded in the signers, we add another base fee, since each transaction will be 5000 lamports
+        // If the Kora signer is not included in the signers, add LAMPORTS_PER_SIGNATURE
         let mut kora_signature_fee = 0u64;
         if !FeeConfigUtil::is_fee_payer_in_signers(transaction, fee_payer)? {
             kora_signature_fee = LAMPORTS_PER_SIGNATURE;
         }
 
-        // Calculate fee payer outflow if fee payer is provided, to better estimate the potential fee
         let fee_payer_outflow =
             FeeConfigUtil::calculate_fee_payer_outflow(fee_payer, transaction, rpc_client, config)
                 .await?;
 
-        // Analyze payment instructions (checks if payment exists + calculates Token2022 fees)
         let (has_payment, transfer_fee_config_amount) =
             FeeConfigUtil::analyze_payment_instructions(
                 config,
@@ -232,33 +226,23 @@ impl FeeConfigUtil {
             )
             .await?;
 
-        // If payment is required but not found, add estimated payment instruction fee
+        // Add estimated instruction fee if payment is required but not present in the tx
         let fee_for_payment_instruction = if is_payment_required && !has_payment {
             ESTIMATED_LAMPORTS_FOR_PAYMENT_INSTRUCTION
         } else {
             0
         };
 
-        let total_fee_lamports = (base_fee as i128)
-            .checked_add(kora_signature_fee as i128)
-            .and_then(|sum| sum.checked_add(fee_payer_outflow))
-            .and_then(|sum| sum.checked_add(fee_for_payment_instruction as i128))
-            .and_then(|sum| sum.checked_add(transfer_fee_config_amount as i128))
-            .map(|sum| sum.max(0) as u64)
-            .ok_or_else(|| {
-                log::error!("Fee calculation overflow: base_fee={}, kora_signature_fee={}, fee_payer_outflow={}, payment_instruction_fee={}, transfer_fee_amount={}",
-                    base_fee, kora_signature_fee, fee_payer_outflow, fee_for_payment_instruction, transfer_fee_config_amount);
-                KoraError::ValidationError("Fee calculation overflow".to_string())
-            })?;
-
-        Ok(TotalFeeCalculation {
-            total_fee_lamports,
+        let mut fee_calculation = TotalFeeCalculation::new(
+            0,
             base_fee,
             kora_signature_fee,
             fee_payer_outflow,
-            payment_instruction_fee: fee_for_payment_instruction,
-            transfer_fee_amount: transfer_fee_config_amount,
-        })
+            fee_for_payment_instruction,
+            transfer_fee_config_amount,
+        );
+        fee_calculation.total_fee_lamports = fee_calculation.get_total_fee_lamports()?;
+        Ok(fee_calculation)
     }
 
     /// Main entry point for fee calculation with Kora's price model applied
@@ -301,20 +285,15 @@ impl FeeConfigUtil {
                     )
                     .await?;
 
-                    Ok(TotalFeeCalculation::new(
-                        fixed_fee_lamports,
-                        fee_calculation.base_fee,
-                        fee_calculation.kora_signature_fee,
-                        fee_calculation.fee_payer_outflow,
-                        fee_calculation.payment_instruction_fee,
-                        fee_calculation.transfer_fee_amount,
-                    ))
+                    Ok(TotalFeeCalculation {
+                        total_fee_lamports: fixed_fee_lamports,
+                        ..fee_calculation
+                    })
                 } else {
                     Ok(TotalFeeCalculation::new_fixed(fixed_fee_lamports))
                 }
             }
             PriceModel::Margin { .. } => {
-                // Get the raw transaction
                 let fee_calculation = Self::estimate_transaction_fee(
                     transaction,
                     fee_payer,
@@ -331,14 +310,7 @@ impl FeeConfigUtil {
                     .get_required_lamports_with_margin(fee_calculation.total_fee_lamports)
                     .await?;
 
-                Ok(TotalFeeCalculation::new(
-                    total_fee_lamports,
-                    fee_calculation.base_fee,
-                    fee_calculation.kora_signature_fee,
-                    fee_calculation.fee_payer_outflow,
-                    fee_calculation.payment_instruction_fee,
-                    fee_calculation.transfer_fee_amount,
-                ))
+                Ok(TotalFeeCalculation { total_fee_lamports, ..fee_calculation })
             }
         }
     }
@@ -376,382 +348,6 @@ impl FeeConfigUtil {
             Ok(None)
         }
     }
-
-    async fn estimate_ata_account_len(
-        ata_creation: &AtaCreationInstructionInfo,
-        rpc_client: &RpcClient,
-        config: &Config,
-        token2022_account_len_cache: &mut HashMap<Pubkey, usize>,
-    ) -> Result<usize, KoraError> {
-        if ata_creation.token_program == spl_token_interface::id() {
-            return Ok(spl_token_interface::state::Account::LEN);
-        }
-
-        if ata_creation.token_program == spl_token_2022_interface::id() {
-            if let Some(account_len) = token2022_account_len_cache.get(&ata_creation.mint) {
-                return Ok(*account_len);
-            }
-
-            let mint_state = TokenUtil::get_mint(config, rpc_client, &ata_creation.mint).await?;
-            let account_len =
-                if let Some(token2022_mint) = mint_state.as_any().downcast_ref::<Token2022Mint>() {
-                    let mut required_account_extensions =
-                        ExtensionType::get_required_init_account_extensions(
-                            &token2022_mint.extensions_types,
-                        );
-                    if !required_account_extensions.contains(&ExtensionType::ImmutableOwner) {
-                        required_account_extensions.push(ExtensionType::ImmutableOwner);
-                    }
-
-                    ExtensionType::try_calculate_account_len::<Token2022Account>(
-                        &required_account_extensions,
-                    )
-                    .map_err(|e| {
-                        KoraError::ValidationError(format!(
-                            "Failed to estimate Token2022 ATA account size for mint {}: {}",
-                            ata_creation.mint, e
-                        ))
-                    })?
-                } else {
-                    spl_token_interface::state::Account::LEN
-                };
-
-            token2022_account_len_cache.insert(ata_creation.mint, account_len);
-            return Ok(account_len);
-        }
-
-        Err(KoraError::ValidationError(format!(
-            "Unsupported token program {} for ATA {}; cannot safely estimate rent",
-            ata_creation.token_program, ata_creation.ata_address
-        )))
-    }
-
-    async fn calculate_ata_creation_outflow(
-        fee_payer_pubkey: &Pubkey,
-        transaction: &mut VersionedTransactionResolved,
-        rpc_client: &RpcClient,
-        config: &Config,
-    ) -> Result<u64, KoraError> {
-        let ata_creations = TokenUtil::find_fee_payer_ata_creations(
-            &transaction.all_instructions,
-            fee_payer_pubkey,
-        );
-        if ata_creations.is_empty() {
-            return Ok(0);
-        }
-
-        let system_created_accounts: HashSet<Pubkey> =
-            transaction
-                .get_or_parse_system_instructions()?
-                .get(&ParsedSystemInstructionType::SystemCreateAccount)
-                .unwrap_or(&vec![])
-                .iter()
-                .filter_map(|instruction| match instruction {
-                    ParsedSystemInstructionData::SystemCreateAccount {
-                        payer, new_account, ..
-                    } if *payer == *fee_payer_pubkey => Some(*new_account),
-                    _ => None,
-                })
-                .collect();
-        let mut rent_cache_by_account_len: HashMap<usize, u64> = HashMap::new();
-        let mut token2022_account_len_cache: HashMap<Pubkey, usize> = HashMap::new();
-        let mut seen_ata_addresses = HashSet::new();
-        let mut total = 0u64;
-
-        for ata_creation in ata_creations {
-            // If simulation already surfaced the underlying SystemCreateAccount CPI for this ATA,
-            // it has already been counted from parsed system instructions.
-            if system_created_accounts.contains(&ata_creation.ata_address) {
-                continue;
-            }
-            if !seen_ata_addresses.insert(ata_creation.ata_address) {
-                continue;
-            }
-
-            let account_len = Self::estimate_ata_account_len(
-                &ata_creation,
-                rpc_client,
-                config,
-                &mut token2022_account_len_cache,
-            )
-            .await?;
-
-            let rent_lamports = if let Some(rent) = rent_cache_by_account_len.get(&account_len) {
-                *rent
-            } else {
-                let rent = rpc_client
-                    .get_minimum_balance_for_rent_exemption(account_len)
-                    .await
-                    .map_err(|e| {
-                        KoraError::RpcError(format!(
-                            "Failed to fetch rent exemption for account length {}: {}",
-                            account_len, e
-                        ))
-                    })?;
-                rent_cache_by_account_len.insert(account_len, rent);
-                rent
-            };
-
-            total = total.checked_add(rent_lamports).ok_or_else(|| {
-                log::error!(
-                    "Outflow calculation overflow in ATA creation accounting: total={}, rent={}",
-                    total,
-                    rent_lamports
-                );
-                KoraError::ValidationError("Outflow calculation overflow".to_string())
-            })?;
-        }
-
-        Ok(total)
-    }
-
-    /// Calculate the total outflow (SOL + SPL token value) that could occur for a fee payer account in a transaction.
-    /// This includes SOL transfers, account creation, SPL token transfers, and other operations that could drain the fee payer's balance.
-    pub async fn calculate_fee_payer_outflow(
-        fee_payer_pubkey: &Pubkey,
-        transaction: &mut VersionedTransactionResolved,
-        rpc_client: &RpcClient,
-        config: &Config,
-    ) -> Result<i128, KoraError> {
-        // Use i128 to correctly handle net outflow when inflows are processed
-        // before outflows. With u64, saturating_sub on 0 would silently discard inflows.
-        let mut total: i128 = 0;
-
-        // Calculate SOL outflow from System Program instructions
-        let parsed_system_instructions = transaction.get_or_parse_system_instructions()?;
-
-        for instruction in parsed_system_instructions
-            .get(&ParsedSystemInstructionType::SystemTransfer)
-            .unwrap_or(&vec![])
-        {
-            if let ParsedSystemInstructionData::SystemTransfer { lamports, sender, receiver } =
-                instruction
-            {
-                if *sender == *fee_payer_pubkey {
-                    total = total.checked_add(*lamports as i128).ok_or_else(|| {
-                        log::error!("Outflow calculation overflow in SystemTransfer");
-                        KoraError::ValidationError("Outflow calculation overflow".to_string())
-                    })?;
-                }
-                if *receiver == *fee_payer_pubkey {
-                    total = total.checked_sub(*lamports as i128).ok_or_else(|| {
-                        log::error!("Inflow calculation overflow in SystemTransfer");
-                        KoraError::ValidationError("Inflow calculation overflow".to_string())
-                    })?;
-                }
-            }
-        }
-
-        for instruction in parsed_system_instructions
-            .get(&ParsedSystemInstructionType::SystemCreateAccount)
-            .unwrap_or(&vec![])
-        {
-            if let ParsedSystemInstructionData::SystemCreateAccount { lamports, payer, .. } =
-                instruction
-            {
-                if *payer == *fee_payer_pubkey {
-                    total = total.checked_add(*lamports as i128).ok_or_else(|| {
-                        log::error!("Outflow calculation overflow in SystemCreateAccount");
-                        KoraError::ValidationError("Outflow calculation overflow".to_string())
-                    })?;
-                }
-            }
-        }
-
-        for instruction in parsed_system_instructions
-            .get(&ParsedSystemInstructionType::SystemWithdrawNonceAccount)
-            .unwrap_or(&vec![])
-        {
-            if let ParsedSystemInstructionData::SystemWithdrawNonceAccount {
-                lamports,
-                nonce_authority,
-                recipient,
-            } = instruction
-            {
-                if *recipient == *fee_payer_pubkey && *nonce_authority == *fee_payer_pubkey {
-                    // Self-withdrawals only move lamports between fee-payer-controlled accounts.
-                    // They should not reduce unrelated outflow elsewhere in the transaction.
-                    continue;
-                } else if *recipient == *fee_payer_pubkey {
-                    // Lamports arriving from a nonce account not controlled by the fee payer are
-                    // a real inflow that reduces net outflow.
-                    total = total.checked_sub(*lamports as i128).ok_or_else(|| {
-                        log::error!("Inflow calculation overflow in SystemWithdrawNonceAccount");
-                        KoraError::ValidationError("Inflow calculation overflow".to_string())
-                    })?;
-                } else if *nonce_authority == *fee_payer_pubkey {
-                    // Fee payer authorized a withdrawal to a third party. The lamports leave a
-                    // nonce account the fee payer controls, so count them as outflow so that
-                    // max_allowed_lamports enforcement is not bypassed.
-                    total = total.checked_add(*lamports as i128).ok_or_else(|| {
-                        log::error!("Outflow calculation overflow in SystemWithdrawNonceAccount");
-                        KoraError::ValidationError("Outflow calculation overflow".to_string())
-                    })?;
-                }
-            }
-        }
-
-        let parsed_alt_instructions = transaction.get_or_parse_alt_instructions()?;
-        for instruction in parsed_alt_instructions
-            .get(&ParsedALTInstructionType::AltCloseLookupTable)
-            .unwrap_or(&vec![])
-        {
-            if let ParsedALTInstructionData::AltCloseLookupTable {
-                lookup_table_account,
-                lookup_table_authority,
-                recipient,
-            } = instruction
-            {
-                let is_fee_payer_authority = *lookup_table_authority == *fee_payer_pubkey;
-                let is_fee_payer_recipient = *recipient == *fee_payer_pubkey;
-
-                if !is_fee_payer_authority && !is_fee_payer_recipient {
-                    continue;
-                }
-
-                if is_fee_payer_authority && is_fee_payer_recipient {
-                    continue;
-                }
-
-                let lamports = rpc_client.get_account(lookup_table_account).await?.lamports;
-
-                if is_fee_payer_recipient {
-                    total = total.checked_sub(lamports as i128).ok_or_else(|| {
-                        log::error!("Inflow calculation overflow in AltCloseLookupTable");
-                        KoraError::ValidationError("Inflow calculation overflow".to_string())
-                    })?;
-                } else {
-                    total = total.checked_add(lamports as i128).ok_or_else(|| {
-                        log::error!("Outflow calculation overflow in AltCloseLookupTable");
-                        KoraError::ValidationError("Outflow calculation overflow".to_string())
-                    })?;
-                }
-            }
-        }
-
-        // Loader-v3 ExtendProgram/ExtendProgramChecked grow a ProgramData account and top up its
-        // rent from the payer. When the fee payer funds the extension, count that rent so a large
-        // extension cannot bypass max_allowed_lamports.
-        let mut fee_payer_extension_byte_sizes: Vec<u32> = Vec::new();
-        {
-            let bpf_v3_instructions =
-                transaction.get_or_parse_bpf_loader_upgradeable_instructions()?;
-            for instruction in [
-                ParsedBpfLoaderUpgradeableInstructionType::ExtendProgram,
-                ParsedBpfLoaderUpgradeableInstructionType::ExtendProgramChecked,
-            ]
-            .iter()
-            .flat_map(|ty| bpf_v3_instructions.get(ty).map(Vec::as_slice).unwrap_or(&[]))
-            {
-                let (payer, additional_bytes) = match instruction {
-                    ParsedBpfLoaderUpgradeableInstructionData::ExtendProgram {
-                        payer,
-                        additional_bytes,
-                        ..
-                    }
-                    | ParsedBpfLoaderUpgradeableInstructionData::ExtendProgramChecked {
-                        payer,
-                        additional_bytes,
-                        ..
-                    } => (payer, *additional_bytes),
-                    _ => continue,
-                };
-
-                if *payer == Some(*fee_payer_pubkey) {
-                    fee_payer_extension_byte_sizes.push(additional_bytes);
-                }
-            }
-        }
-
-        // Conservatively charge the rent-exempt minimum for the added bytes per extension
-        // (matching the ATA-creation accounting below).
-        for additional_bytes in fee_payer_extension_byte_sizes {
-            let extension_rent = rpc_client
-                .get_minimum_balance_for_rent_exemption(additional_bytes as usize)
-                .await?;
-            total = total.checked_add(extension_rent as i128).ok_or_else(|| {
-                log::error!("Outflow calculation overflow in ExtendProgram rent");
-                KoraError::ValidationError("Outflow calculation overflow".to_string())
-            })?;
-        }
-
-        // ATA Create/CreateIdempotent can be no-ops during simulation depending on prestate.
-        // Charge conservative rent for fee-payer-funded ATA creations whenever inner SystemCreateAccount
-        // did not surface, preventing stale-state rent drain windows.
-        let ata_outflow =
-            Self::calculate_ata_creation_outflow(fee_payer_pubkey, transaction, rpc_client, config)
-                .await?;
-        total = total.checked_add(ata_outflow as i128).ok_or_else(|| {
-            log::error!(
-                "Outflow calculation overflow in ATA accounting: sol_total={}, ata_outflow={}",
-                total,
-                ata_outflow
-            );
-            KoraError::ValidationError("Outflow calculation overflow".to_string())
-        })?;
-
-        // Calculate SPL token transfer outflow (converted to lamports value)
-        let spl_instructions = transaction.get_or_parse_spl_instructions()?;
-        let empty_vec = vec![];
-        let spl_transfers =
-            spl_instructions.get(&ParsedSPLInstructionType::SplTokenTransfer).unwrap_or(&empty_vec);
-
-        if !spl_transfers.is_empty() {
-            let spl_outflow = TokenUtil::calculate_spl_transfers_value_in_lamports(
-                spl_transfers,
-                fee_payer_pubkey,
-                rpc_client,
-                config,
-            )
-            .await?;
-
-            total = total.checked_add(spl_outflow as i128).ok_or_else(|| {
-                log::error!("Fee payer outflow overflow: sol={}, spl={}", total, spl_outflow);
-                KoraError::ValidationError("Fee payer outflow calculation overflow".to_string())
-            })?;
-        }
-
-        // A fee-payer-authorized close to a third party moves the closed account's rent out.
-        let close_accounts = spl_instructions
-            .get(&ParsedSPLInstructionType::SplTokenCloseAccount)
-            .unwrap_or(&empty_vec);
-        for instruction in close_accounts {
-            if let ParsedSPLInstructionData::SplTokenCloseAccount {
-                owner,
-                account,
-                destination,
-                ..
-            } = instruction
-            {
-                let is_fee_payer_authority = *owner == *fee_payer_pubkey;
-                let is_fee_payer_recipient = *destination == *fee_payer_pubkey;
-
-                if !is_fee_payer_authority && !is_fee_payer_recipient {
-                    continue;
-                }
-
-                if is_fee_payer_authority && is_fee_payer_recipient {
-                    continue;
-                }
-
-                let lamports = rpc_client.get_account(account).await?.lamports;
-
-                if is_fee_payer_recipient {
-                    total = total.checked_sub(lamports as i128).ok_or_else(|| {
-                        log::error!("Inflow calculation overflow in SplTokenCloseAccount");
-                        KoraError::ValidationError("Inflow calculation overflow".to_string())
-                    })?;
-                } else {
-                    total = total.checked_add(lamports as i128).ok_or_else(|| {
-                        log::error!("Outflow calculation overflow in SplTokenCloseAccount");
-                        KoraError::ValidationError("Outflow calculation overflow".to_string())
-                    })?;
-                }
-            }
-        }
-
-        Ok(total)
-    }
 }
 
 pub struct TransactionFeeUtil {}
@@ -786,19 +382,62 @@ impl TransactionFeeUtil {
         rpc_client: &RpcClient,
         resolved_transaction: &VersionedTransactionResolved,
     ) -> Result<u64, KoraError> {
-        let message = &resolved_transaction.transaction.message;
+        Self::get_estimate_fee(rpc_client, &resolved_transaction.transaction.message).await
+    }
 
-        match message {
-            VersionedMessage::Legacy(message) => {
-                // Legacy transactions don't have lookup tables, use as-is
-                rpc_client.get_fee_for_message(message).await
+    /// Priority fee in lamports the transaction requests: the config field for V1,
+    /// ComputeBudget price times limit for legacy/V0.
+    ///
+    /// When no SetComputeUnitLimit is present the runtime derives a default limit per
+    /// instruction, charging a builtin less than a program. Deriving it here would take the
+    /// cluster's feature set, so every instruction is billed at the higher per-instruction
+    /// default instead: an upper bound on the runtime's own default, so the cap can only
+    /// over-reject, never under.
+    ///
+    /// `account_keys` must be the resolved key list: the runtime resolves program
+    /// ids against lookup-table loaded keys too.
+    pub fn get_requested_priority_fee(message: &VersionedMessage, account_keys: &[Pubkey]) -> u64 {
+        if let VersionedMessage::V1(v1_message) = message {
+            return v1_message.config.priority_fee.unwrap_or(0);
+        }
+
+        let compute_budget_program_id = solana_compute_budget_interface::id();
+        let mut compute_unit_price: Option<u64> = None;
+        let mut compute_unit_limit: Option<u32> = None;
+        let mut non_compute_budget_instructions: u32 = 0;
+        for instruction in message.instructions() {
+            if account_keys.get(instruction.program_id_index as usize)
+                != Some(&compute_budget_program_id)
+            {
+                non_compute_budget_instructions = non_compute_budget_instructions.saturating_add(1);
+                continue;
             }
-            VersionedMessage::V0(v0_message) => rpc_client.get_fee_for_message(v0_message).await,
-            VersionedMessage::V1(v1_message) => {
-                rpc_client.get_fee_for_message(&V1FeeMessage(v1_message)).await
+            match borsh::from_slice(&instruction.data) {
+                Ok(ComputeBudgetInstruction::SetComputeUnitPrice(micro_lamports)) => {
+                    compute_unit_price.get_or_insert(micro_lamports);
+                }
+                Ok(ComputeBudgetInstruction::SetComputeUnitLimit(units)) => {
+                    compute_unit_limit.get_or_insert(units);
+                }
+                _ => {}
             }
         }
-        .map_err(|e| KoraError::RpcError(e.to_string()))
+
+        let Some(price) = compute_unit_price.filter(|price| *price > 0) else {
+            return 0;
+        };
+
+        let default_compute_unit_limit =
+            non_compute_budget_instructions.saturating_mul(DEFAULT_INSTRUCTION_COMPUTE_UNIT_LIMIT);
+
+        ComputeBudgetLimits {
+            compute_unit_price: price,
+            compute_unit_limit: compute_unit_limit
+                .unwrap_or(default_compute_unit_limit)
+                .min(MAX_COMPUTE_UNIT_LIMIT),
+            ..Default::default()
+        }
+        .get_prioritization_fee()
     }
 }
 
@@ -820,6 +459,9 @@ mod tests {
             },
             config_mock::{mock_state::get_config, ConfigMockBuilder},
             rpc_mock::RpcMockBuilder,
+            transaction_mock::{
+                create_legacy_message, create_v0_message_with_alt_loaded_program, create_v1_message,
+            },
         },
         token::{
             interface::TokenInterface, spl_token::TokenProgram, spl_token_2022::Token2022Program,
@@ -845,6 +487,7 @@ mod tests {
         program::ID as SYSTEM_PROGRAM_ID,
     };
     use spl_associated_token_account_interface::address::get_associated_token_address;
+    use spl_token_2022_interface::extension::ExtensionType;
 
     fn create_token2022_transfer_checked_resolved_transaction(
         owner: &Pubkey,
@@ -1173,7 +816,6 @@ mod tests {
         let fee_payer = Pubkey::new_unique();
         let recipient = Pubkey::new_unique();
 
-        // Test 1: Fee payer as sender - should add to outflow
         let transfer_instruction = transfer(&fee_payer, &recipient, 100_000);
         let message =
             VersionedMessage::Legacy(Message::new(&[transfer_instruction], Some(&fee_payer)));
@@ -1191,7 +833,6 @@ mod tests {
         .unwrap();
         assert_eq!(outflow, 100_000, "Transfer from fee payer should add to outflow");
 
-        // Test 2: Fee payer as recipient - should subtract from outflow
         let sender = Pubkey::new_unique();
         let transfer_instruction = transfer(&sender, &fee_payer, 50_000);
         let message =
@@ -1209,7 +850,6 @@ mod tests {
         .unwrap();
         assert_eq!(outflow, -50_000, "Transfer to fee payer should be negative (net inflow)");
 
-        // Test 3: Other account as sender - should not affect outflow
         let other_sender = Pubkey::new_unique();
         let transfer_instruction = transfer(&other_sender, &recipient, 500_000);
         let message =
@@ -1234,8 +874,6 @@ mod tests {
         let mocked_rpc_client = RpcMockBuilder::new().build();
         let fee_payer = Pubkey::new_unique();
         let recipient = Pubkey::new_unique();
-
-        // Test 1: Fee payer as sender (index 1 for TransferWithSeed)
         let transfer_instruction = transfer_with_seed(
             &fee_payer,
             &fee_payer,
@@ -1259,7 +897,6 @@ mod tests {
         .unwrap();
         assert_eq!(outflow, 150_000, "TransferWithSeed from fee payer should add to outflow");
 
-        // Test 2: Fee payer as recipient (index 2 for TransferWithSeed)
         let other_sender = Pubkey::new_unique();
         let transfer_instruction = transfer_with_seed(
             &other_sender,
@@ -1294,8 +931,6 @@ mod tests {
         let mocked_rpc_client = RpcMockBuilder::new().build();
         let fee_payer = Pubkey::new_unique();
         let new_account = Pubkey::new_unique();
-
-        // Test 1: Fee payer funding CreateAccount
         let create_instruction =
             create_account(&fee_payer, &new_account, 200_000, 100, &SYSTEM_PROGRAM_ID);
         let message =
@@ -1313,7 +948,6 @@ mod tests {
         .unwrap();
         assert_eq!(outflow, 200_000, "CreateAccount funded by fee payer should add to outflow");
 
-        // Test 2: Other account funding CreateAccount
         let other_funder = Pubkey::new_unique();
         let create_instruction =
             create_account(&other_funder, &new_account, 1_000_000, 100, &SYSTEM_PROGRAM_ID);
@@ -1348,7 +982,6 @@ mod tests {
             .build();
         let config = get_config().unwrap();
 
-        // Fee payer funds the extension: the extension rent counts toward outflow.
         let ix = solana_loader_v3_interface::instruction::extend_program(
             &program,
             Some(&fee_payer),
@@ -1370,7 +1003,6 @@ mod tests {
             "fee-payer-funded ExtendProgram rent should count as outflow"
         );
 
-        // A different payer funds the extension: no outflow for the fee payer.
         let other_payer = Pubkey::new_unique();
         let ix = solana_loader_v3_interface::instruction::extend_program(
             &program,
@@ -1390,7 +1022,6 @@ mod tests {
         .unwrap();
         assert_eq!(outflow, 0, "extension funded by another payer should not affect outflow");
 
-        // No payer funds the extension: nothing counts toward the fee payer's outflow.
         let ix = solana_loader_v3_interface::instruction::extend_program(&program, None, 4096);
         let message = VersionedMessage::Legacy(Message::new(&[ix], Some(&fee_payer)));
         let mut resolved =
@@ -1412,8 +1043,6 @@ mod tests {
         let mocked_rpc_client = RpcMockBuilder::new().build();
         let fee_payer = Pubkey::new_unique();
         let new_account = Pubkey::new_unique();
-
-        // Test: Fee payer funding CreateAccountWithSeed
         let create_instruction = create_account_with_seed(
             &fee_payer,
             &new_account,
@@ -1449,10 +1078,6 @@ mod tests {
         let nonce_account = Pubkey::new_unique();
         let fee_payer = Pubkey::new_unique();
         let recipient = Pubkey::new_unique();
-
-        // Test 1: Fee payer as nonce authority withdrawing to a third party — counts as outflow.
-        // The fee payer controls the nonce account via authority; lamports leaving it to a
-        // different destination bypass max_allowed_lamports if not tracked.
         let withdraw_instruction =
             withdraw_nonce_account(&nonce_account, &fee_payer, &recipient, 50_000);
         let message =
@@ -1473,7 +1098,6 @@ mod tests {
             "WithdrawNonceAccount with fee payer as authority to third party should count as outflow"
         );
 
-        // Test 2: Fee payer as both authority and recipient — internal movement only.
         let nonce_account = Pubkey::new_unique();
         let withdraw_instruction =
             withdraw_nonce_account(&nonce_account, &fee_payer, &fee_payer, 25_000);
@@ -1495,7 +1119,6 @@ mod tests {
             "WithdrawNonceAccount from a fee-payer-controlled nonce account back to fee payer should be neutral"
         );
 
-        // Test 3: Unrelated authority withdrawing to the fee payer — genuine inflow.
         let other_authority = Pubkey::new_unique();
         let withdraw_instruction =
             withdraw_nonce_account(&nonce_account, &other_authority, &fee_payer, 25_000);
@@ -1517,7 +1140,6 @@ mod tests {
             "WithdrawNonceAccount to fee payer from an unrelated authority should be negative (net inflow)"
         );
 
-        // Test 4: Unrelated authority (not fee payer) withdrawing to third party — no effect.
         let other_authority = Pubkey::new_unique();
         let other_recipient = Pubkey::new_unique();
         let withdraw_instruction =
@@ -1781,11 +1403,10 @@ mod tests {
         let sender = Pubkey::new_unique();
         let new_account = Pubkey::new_unique();
 
-        // Multiple instructions involving fee payer
         let instructions = vec![
-            transfer(&fee_payer, &recipient, 100_000), // +100,000
-            transfer(&sender, &fee_payer, 30_000),     // -30,000
-            create_account(&fee_payer, &new_account, 50_000, 100, &SYSTEM_PROGRAM_ID), // +50,000
+            transfer(&fee_payer, &recipient, 100_000),
+            transfer(&sender, &fee_payer, 30_000),
+            create_account(&fee_payer, &new_account, 50_000, 100, &SYSTEM_PROGRAM_ID),
         ];
         let message = VersionedMessage::Legacy(Message::new(&instructions, Some(&fee_payer)));
         let mut resolved_transaction =
@@ -1812,7 +1433,6 @@ mod tests {
         let fee_payer = Pubkey::new_unique();
         let fake_program = Pubkey::new_unique();
 
-        // Test with non-system program - should not affect outflow
         let instruction = Instruction::new_with_bincode(
             fake_program,
             &[0u8],
@@ -2049,7 +1669,6 @@ mod tests {
             )
             .unwrap();
 
-        // Create message with the payment instruction
         let message = VersionedMessage::Legacy(Message::new(&[transfer_instruction], None));
         let mut resolved_transaction =
             TransactionUtil::new_unsigned_versioned_transaction_resolved(message).unwrap();
@@ -2152,10 +1771,8 @@ mod tests {
         let sender = Keypair::new();
         let recipient = Pubkey::new_unique();
 
-        // Create SOL transfer instruction (no SPL transfer to payment destination)
         let sol_transfer = transfer(&sender.pubkey(), &recipient, 100_000);
 
-        // Create message without payment instruction
         let message = VersionedMessage::Legacy(Message::new(&[sol_transfer], None));
         let mut resolved_transaction =
             TransactionUtil::new_unsigned_versioned_transaction_resolved(message).unwrap();
@@ -2187,11 +1804,9 @@ mod tests {
         let mocked_account = create_mock_token_account(&sender.pubkey(), &mint);
         let mocked_rpc_client = create_mock_rpc_client_with_account(&mocked_account);
 
-        // Create token accounts
         let sender_token_account = get_associated_token_address(&sender.pubkey(), &mint);
         let recipient_token_account = get_associated_token_address(&sender.pubkey(), &mint);
 
-        // Create SPL transfer instruction to DIFFERENT destination (not payment)
         let transfer_instruction = TokenProgram::new()
             .create_transfer_instruction(
                 &sender_token_account,
@@ -2201,7 +1816,6 @@ mod tests {
             )
             .unwrap();
 
-        // Create message with non-payment transfer
         let message = VersionedMessage::Legacy(Message::new(&[transfer_instruction], None));
         let mut resolved_transaction =
             TransactionUtil::new_unsigned_versioned_transaction_resolved(message).unwrap();
@@ -2228,10 +1842,8 @@ mod tests {
         let fee_payer = Keypair::new();
         let recipient = Pubkey::new_unique();
 
-        // Mock RPC client that returns base fee
         let mocked_rpc_client = RpcMockBuilder::new().with_fee_estimate(5000).build();
 
-        // Create simple SOL transfer
         let transfer_instruction = transfer(&fee_payer.pubkey(), &recipient, 100_000);
         let message = VersionedMessage::Legacy(Message::new(
             &[transfer_instruction],
@@ -2266,7 +1878,6 @@ mod tests {
 
         let mocked_rpc_client = RpcMockBuilder::new().with_fee_estimate(5000).build();
 
-        // Create transaction where sender pays, but kora_fee_payer is different
         let transfer_instruction = transfer(&sender.pubkey(), &recipient, 100_000);
         let message =
             VersionedMessage::Legacy(Message::new(&[transfer_instruction], Some(&sender.pubkey())));
@@ -2304,7 +1915,6 @@ mod tests {
 
         let mocked_rpc_client = RpcMockBuilder::new().with_fee_estimate(5000).build();
 
-        // Create transaction with no payment instruction
         let transfer_instruction = transfer(&fee_payer.pubkey(), &recipient, 100_000);
         let message = VersionedMessage::Legacy(Message::new(
             &[transfer_instruction],
@@ -2325,7 +1935,6 @@ mod tests {
         .await
         .unwrap();
 
-        // Should include base fee + fee payer outflow + payment instruction fee
         let expected = 5000 + 100_000 + ESTIMATED_LAMPORTS_FOR_PAYMENT_INSTRUCTION;
         assert_eq!(
             result.total_fee_lamports, expected,
@@ -2447,5 +2056,173 @@ mod tests {
             .unwrap();
 
         assert_eq!(result, 9000, "Should return mocked base fee for V1 message");
+    }
+
+    #[test]
+    fn test_get_requested_priority_fee_legacy_price_and_limit() {
+        let payer = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        let message = create_legacy_message(
+            &payer,
+            &[
+                ComputeBudgetInstruction::set_compute_unit_limit(300_000),
+                ComputeBudgetInstruction::set_compute_unit_price(25_000),
+                transfer(&payer, &recipient, 1_000),
+            ],
+        );
+
+        assert_eq!(
+            TransactionFeeUtil::get_requested_priority_fee(&message, message.static_account_keys()),
+            7_500
+        );
+    }
+
+    #[test]
+    fn test_get_requested_priority_fee_rounds_up() {
+        let payer = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        let message = create_legacy_message(
+            &payer,
+            &[
+                ComputeBudgetInstruction::set_compute_unit_limit(100),
+                ComputeBudgetInstruction::set_compute_unit_price(1),
+                transfer(&payer, &recipient, 1_000),
+            ],
+        );
+
+        assert_eq!(
+            TransactionFeeUtil::get_requested_priority_fee(&message, message.static_account_keys()),
+            1
+        );
+    }
+
+    #[test]
+    fn test_get_requested_priority_fee_price_without_limit_bills_per_instruction_default() {
+        let payer = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        let message = create_legacy_message(
+            &payer,
+            &[
+                ComputeBudgetInstruction::set_compute_unit_price(2_000),
+                transfer(&payer, &recipient, 1_000),
+            ],
+        );
+
+        // The lone transfer defaults to 200_000 CU, so 2_000 micro-lamports over it = 400 lamports.
+        // Billing the 1.4M protocol maximum instead would overstate this sevenfold.
+        assert_eq!(
+            TransactionFeeUtil::get_requested_priority_fee(&message, message.static_account_keys()),
+            400
+        );
+    }
+
+    #[test]
+    fn test_get_requested_priority_fee_default_limit_clamps_to_protocol_maximum() {
+        let payer = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        let mut instructions = vec![ComputeBudgetInstruction::set_compute_unit_price(2_000)];
+        instructions.extend((0..8).map(|_| transfer(&payer, &recipient, 1_000)));
+        let message = create_legacy_message(&payer, &instructions);
+
+        // 8 instructions x 200_000 = 1.6M CU, over the 1.4M the runtime will grant,
+        // so the fee is 2_000 micro-lamports over 1.4M = 2_800 lamports.
+        assert_eq!(
+            TransactionFeeUtil::get_requested_priority_fee(&message, message.static_account_keys()),
+            2_800
+        );
+    }
+
+    #[test]
+    fn test_get_requested_priority_fee_zero_without_price() {
+        let payer = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+
+        let no_compute_budget =
+            create_legacy_message(&payer, &[transfer(&payer, &recipient, 1_000)]);
+        assert_eq!(
+            TransactionFeeUtil::get_requested_priority_fee(
+                &no_compute_budget,
+                no_compute_budget.static_account_keys()
+            ),
+            0
+        );
+
+        let zero_price = create_legacy_message(
+            &payer,
+            &[
+                ComputeBudgetInstruction::set_compute_unit_limit(300_000),
+                ComputeBudgetInstruction::set_compute_unit_price(0),
+                transfer(&payer, &recipient, 1_000),
+            ],
+        );
+        assert_eq!(
+            TransactionFeeUtil::get_requested_priority_fee(
+                &zero_price,
+                zero_price.static_account_keys()
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn test_get_requested_priority_fee_v1_reads_config() {
+        let message = create_v1_message(
+            &Pubkey::new_unique(),
+            v1::TransactionConfig::empty().with_priority_fee(1_234).with_compute_unit_limit(200),
+        );
+        assert_eq!(
+            TransactionFeeUtil::get_requested_priority_fee(&message, message.static_account_keys()),
+            1_234
+        );
+
+        let no_fee = create_v1_message(&Pubkey::new_unique(), v1::TransactionConfig::empty());
+        assert_eq!(
+            TransactionFeeUtil::get_requested_priority_fee(&no_fee, no_fee.static_account_keys()),
+            0
+        );
+    }
+
+    #[test]
+    fn test_get_requested_priority_fee_v1_ignores_compute_budget_instructions() {
+        let payer = Keypair::new();
+        let recipient = Pubkey::new_unique();
+        let message = v1::Message::try_compile(
+            &payer.pubkey(),
+            &[
+                ComputeBudgetInstruction::set_compute_unit_price(50_000),
+                transfer(&payer.pubkey(), &recipient, 1_000),
+            ],
+            Hash::default(),
+        )
+        .expect("Failed to compile V1 message");
+
+        // The runtime treats ComputeBudget instructions in V1 transactions as
+        // no-ops; only the config field carries the priority fee.
+        let message = VersionedMessage::V1(message);
+        assert_eq!(
+            TransactionFeeUtil::get_requested_priority_fee(&message, message.static_account_keys()),
+            0
+        );
+    }
+
+    #[test]
+    fn test_get_requested_priority_fee_v0_with_alt_loaded_compute_budget() {
+        let payer = Pubkey::new_unique();
+        let limit_data = ComputeBudgetInstruction::set_compute_unit_limit(300_000).data;
+        let price_data = ComputeBudgetInstruction::set_compute_unit_price(2_000).data;
+
+        // The ComputeBudget program id lives past the static keys (loaded from a
+        // lookup table); the runtime still processes these instructions, so the
+        // extraction must resolve program ids against the full resolved key list.
+        let message =
+            create_v0_message_with_alt_loaded_program(&payer, vec![limit_data, price_data]);
+        let resolved_keys = vec![payer, solana_compute_budget_interface::id()];
+
+        assert_eq!(
+            TransactionFeeUtil::get_requested_priority_fee(&message, &resolved_keys),
+            600,
+            "300_000 CU * 2_000 micro-lamports = 600 lamports must be counted \
+             even when the ComputeBudget program is loaded via a lookup table"
+        );
     }
 }

@@ -36,7 +36,6 @@ pub struct UsageTracker {
     enabled: bool,
     store: Arc<dyn UsageStore>,
     rules: Vec<UsageRule>,
-    instruction_rule_indices: Vec<usize>,
     fallback_if_unavailable: bool,
 }
 
@@ -47,21 +46,7 @@ impl UsageTracker {
         rules: Vec<UsageRule>,
         fallback_if_unavailable: bool,
     ) -> Self {
-        // Pre-compute instruction rule indices at initialization
-        let instruction_rule_indices: Vec<usize> =
-            rules
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, rule)| {
-                    if matches!(rule, UsageRule::Instruction(_)) {
-                        Some(idx)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-        Self { enabled, store, rules, instruction_rule_indices, fallback_if_unavailable }
+        Self { enabled, store, rules, fallback_if_unavailable }
     }
 
     fn get_usage_limiter() -> Result<Option<&'static UsageTracker>, KoraError> {
@@ -78,7 +63,7 @@ impl UsageTracker {
     }
 
     fn has_instruction_rules(&self) -> bool {
-        !self.instruction_rule_indices.is_empty()
+        self.rules.iter().any(|rule| rule.as_instruction().is_some())
     }
 
     async fn owner_signed_or_authorized_by_multisig(
@@ -113,50 +98,35 @@ impl UsageTracker {
             return Ok(false);
         }
 
-        let (required_signers, multisig_members): (usize, HashSet<Pubkey>) = if is_2022 {
+        let multisig = if is_2022 {
             if owner_account.owner != spl_token_2022_interface::id() {
                 return Ok(false);
             }
 
-            let Ok(multisig) =
-                spl_token_2022_interface::state::Multisig::unpack(&owner_account.data)
-            else {
-                return Ok(false);
-            };
-
-            (
-                multisig.m as usize,
-                multisig
-                    .signers
-                    .iter()
-                    .take(multisig.n as usize)
-                    .copied()
-                    .filter(|signer| *signer != Pubkey::default())
-                    .collect(),
-            )
+            spl_token_2022_interface::state::Multisig::unpack(&owner_account.data)
+                .map(|multisig| (multisig.m, multisig.n, multisig.signers))
         } else {
             if owner_account.owner != spl_token_interface::id() {
                 return Ok(false);
             }
 
-            let Ok(multisig) = spl_token_interface::state::Multisig::unpack(&owner_account.data)
-            else {
-                return Ok(false);
-            };
-
-            (
-                multisig.m as usize,
-                multisig
-                    .signers
-                    .iter()
-                    .take(multisig.n as usize)
-                    .copied()
-                    .filter(|signer| *signer != Pubkey::default())
-                    .collect(),
-            )
+            spl_token_interface::state::Multisig::unpack(&owner_account.data)
+                .map(|multisig| (multisig.m, multisig.n, multisig.signers))
         };
 
-        Ok(verified_instruction_signers.intersection(&multisig_members).count() >= required_signers)
+        let Ok((required_signers, signer_count, signers)) = multisig else {
+            return Ok(false);
+        };
+
+        let multisig_members: HashSet<Pubkey> = signers
+            .iter()
+            .take(signer_count as usize)
+            .copied()
+            .filter(|signer| *signer != Pubkey::default())
+            .collect();
+
+        Ok(verified_instruction_signers.intersection(&multisig_members).count()
+            >= required_signers as usize)
     }
 
     async fn extract_user_from_payment_instruction(
@@ -199,7 +169,6 @@ impl UsageTracker {
                 let token_account =
                     token_program.unpack_token_account(&destination_account.data)?;
 
-                // Check if this is a payment to Kora
                 if token_account.owner() == payment_destination
                     && Self::owner_signed_or_authorized_by_multisig(
                         owner,
@@ -213,17 +182,8 @@ impl UsageTracker {
                 {
                     // Key usage by the funding wallet (the source token account's owner), not the
                     // transfer authority, which can be a rotatable delegate or multisig member.
-                    let source_account = match CacheUtil::get_account(
-                        config,
-                        rpc_client,
-                        source_address,
-                        true,
-                    )
-                    .await
-                    {
-                        Ok(account) => account,
-                        Err(e) => return Err(e),
-                    };
+                    let source_account =
+                        CacheUtil::get_account(config, rpc_client, source_address, true).await?;
                     let source_token_program =
                         TokenType::get_token_program_from_owner(&source_account.owner)?;
                     let source_token_account =
@@ -250,35 +210,10 @@ impl UsageTracker {
             return Ok(LimiterResult::Allowed);
         }
 
-        // Extract instruction rules using pre-computed indices (no per-request separation)
-        let instruction_rules: Vec<&InstructionRule> = self
-            .instruction_rule_indices
-            .iter()
-            .filter_map(|&idx| self.rules[idx].as_instruction())
-            .collect();
-
-        // Batch count instruction rules in single pass
-        let instruction_counts = if !instruction_rules.is_empty() {
-            InstructionRule::count_all_rules(&instruction_rules, ctx)
-        } else {
-            Vec::new()
-        };
-
-        let ix_idx_set: HashSet<usize> = self.instruction_rule_indices.iter().copied().collect();
-
-        let mut rule_increments = Vec::with_capacity(self.rules.len());
-        let mut instruction_count_idx = 0;
-
-        for (idx, _rule) in self.rules.iter().enumerate() {
-            let increment_count = if ix_idx_set.contains(&idx) {
-                let count = instruction_counts[instruction_count_idx];
-                instruction_count_idx += 1;
-                count
-            } else {
-                1
-            };
-            rule_increments.push(increment_count);
-        }
+        let instruction_rules: Vec<&InstructionRule> =
+            self.rules.iter().filter_map(UsageRule::as_instruction).collect();
+        let mut instruction_counts =
+            InstructionRule::count_all_rules(&instruction_rules, ctx).into_iter();
 
         let mut pending_increments = Vec::with_capacity(self.rules.len());
 
@@ -288,8 +223,13 @@ impl UsageTracker {
         // bypassing the limit.
         ctx.timestamp = Self::current_timestamp();
 
-        for (idx, rule) in self.rules.iter().enumerate() {
-            let increment_count = rule_increments[idx];
+        for rule in &self.rules {
+            let increment_count = match rule {
+                UsageRule::Instruction(_) => instruction_counts
+                    .next()
+                    .expect("count_all_rules returns one count per instruction rule"),
+                UsageRule::Transaction(_) => 1,
+            };
             if increment_count == 0 {
                 continue;
             }
@@ -624,19 +564,16 @@ mod tests {
             timestamp: 1000000,
         };
 
-        // First transaction should succeed
         assert!(matches!(
             tracker.check_and_record(&mut ctx1).await.unwrap(),
             LimiterResult::Allowed
         ));
 
-        // Second transaction should succeed (at limit)
         assert!(matches!(
             tracker.check_and_record(&mut ctx2).await.unwrap(),
             LimiterResult::Allowed
         ));
 
-        // Third transaction should fail (over limit)
         assert!(matches!(
             tracker.check_and_record(&mut ctx3).await.unwrap(),
             LimiterResult::Denied { .. }
@@ -700,7 +637,6 @@ mod tests {
         let user_id1 = "test-user-1".to_string();
         let user_id2 = "test-user-2".to_string();
 
-        // Use up user1's limit
         let mut tx1a = create_mock_resolved_transaction();
         let mut ctx1a = LimiterContext {
             transaction: &mut tx1a,
@@ -735,7 +671,6 @@ mod tests {
             LimiterResult::Denied { .. }
         ));
 
-        // User2 should still be able to make transactions
         let mut tx2a = create_mock_resolved_transaction();
         let mut ctx2a = LimiterContext {
             transaction: &mut tx2a,
@@ -785,7 +720,6 @@ mod tests {
 
         let user_id = "test-user-unlimited".to_string();
 
-        // Should allow many transactions when no rules (limiter is not enabled)
         for _ in 0..10 {
             let mut tx = create_mock_resolved_transaction();
             let mut ctx = LimiterContext {
@@ -821,10 +755,8 @@ mod tests {
         let tracker = UsageTracker::new(true, store, rules, false);
 
         let user_id = "test-user-multiple-rules".to_string();
-        // Use realistic timestamp (current time) so expiry calculations work correctly
         let now = UsageTracker::current_timestamp();
 
-        // First two should pass (time bucket limit is 2)
         let mut tx1 = create_mock_resolved_transaction();
         let mut ctx1 = LimiterContext {
             transaction: &mut tx1,
@@ -848,7 +780,6 @@ mod tests {
             LimiterResult::Allowed
         ));
 
-        // Third should fail (time bucket limit exceeded)
         let mut tx3 = create_mock_resolved_transaction();
         let mut ctx3 = LimiterContext {
             transaction: &mut tx3,
@@ -864,7 +795,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_usage_limiter_disabled_fallback() {
-        // Test that when usage limiting is disabled, transactions are allowed
         let _m = ConfigMockBuilder::new().with_usage_limit_enabled(false).build_and_setup();
 
         // Initialize the usage limiter - it should set to None when disabled
@@ -897,7 +827,6 @@ mod tests {
             .with_usage_limit_fallback(true)
             .build_and_setup();
 
-        // Initialize with no cache_url - should use in-memory store but no rules = limiter disabled
         let _ = UsageTracker::init_usage_limiter().await;
 
         let config = get_config().unwrap();
@@ -923,7 +852,6 @@ mod tests {
             .with_usage_limit_fallback(false)
             .build_and_setup();
 
-        // Initialize with no cache_url and no rules - should set limiter to None
         let _ = UsageTracker::init_usage_limiter().await;
 
         let config = get_config().unwrap();
@@ -966,8 +894,6 @@ mod tests {
         let config = ConfigMockBuilder::new().build();
         let rpc_client = RpcMockBuilder::new().build();
 
-        // signer_a is the message fee payer (first signer slot); signer_b funds the CreateAccount
-        // and is the signer Kora is asked to sign with.
         let signer_a = Keypair::new();
         let signer_b = Keypair::new();
         let new_account = Keypair::new();
@@ -987,8 +913,6 @@ mod tests {
             .unwrap()
         };
 
-        // Selecting signer_b binds counting to signer_b: its CreateAccount is subsidized, so the
-        // 4th request trips the limit.
         for attempt in 1..=3 {
             let mut tx = build_tx();
             tracker
@@ -1009,8 +933,6 @@ mod tests {
             .expect_err("4th request for signer_b must exceed the CreateAccount limit");
         assert!(matches!(err, KoraError::UsageLimitExceeded(_)));
 
-        // Selecting signer_a (the first message signer) does not subsidize the CreateAccount whose
-        // payer is signer_b, so accounting stays at zero and the limit is never reached.
         for attempt in 1..=5 {
             let mut tx = build_tx();
             tracker
@@ -1173,8 +1095,6 @@ mod tests {
             .build_with_sequential_accounts(vec![&destination_account, &source_account]);
         let config = ConfigMockBuilder::new().build();
 
-        // The transfer authority is a delegate (signed), but the source account is owned by
-        // source_owner. Usage identity must be the funding wallet, not the rotatable delegate.
         let mut tx = make_spl_transfer_transaction(
             &delegate.pubkey(),
             &[],

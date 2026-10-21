@@ -37,6 +37,8 @@ impl TransactionUtil {
             KoraError::InvalidTransaction(format!("Invalid transaction message: {e}"))
         })?;
 
+        Self::validate_v1_resource_limits(&transaction.message)?;
+
         let max_size = Self::max_transaction_size(&transaction.message);
         if decoded.len() > max_size {
             return Err(KoraError::InvalidTransaction(format!(
@@ -46,6 +48,34 @@ impl TransactionUtil {
         }
 
         Ok(transaction)
+    }
+
+    /// A limit a V1 transaction config leaves unset is zero, not the runtime default legacy
+    /// and V0 transactions fall back to, and zero compute units or zero loadable account
+    /// bytes cannot run any instruction. Rejecting that here means the caller gets an
+    /// actionable error before Kora simulates, signs, or pays for a transaction that cannot
+    /// execute.
+    fn validate_v1_resource_limits(message: &VersionedMessage) -> Result<(), KoraError> {
+        let VersionedMessage::V1(v1_message) = message else {
+            return Ok(());
+        };
+
+        let mut unset_limits = Vec::new();
+        if v1_message.config.compute_unit_limit.unwrap_or(0) == 0 {
+            unset_limits.push("compute_unit_limit");
+        }
+        if v1_message.config.loaded_accounts_data_size_limit.unwrap_or(0) == 0 {
+            unset_limits.push("loaded_accounts_data_size_limit");
+        }
+
+        if !unset_limits.is_empty() {
+            return Err(KoraError::InvalidTransaction(format!(
+                "V1 transaction config must set {} to a non-zero value",
+                unset_limits.join(" and ")
+            )));
+        }
+
+        Ok(())
     }
 
     pub fn new_unsigned_versioned_transaction(message: VersionedMessage) -> VersionedTransaction {
@@ -89,7 +119,7 @@ impl TransactionUtil {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::KoraError;
+    use crate::{error::KoraError, tests::transaction_mock::create_mock_encoded_v1_transaction};
     use solana_message::{compiled_instruction::CompiledInstruction, v0, v1, Message};
     use solana_sdk::{
         hash::Hash,
@@ -105,7 +135,21 @@ mod tests {
             &data,
             vec![AccountMeta::new(keypair.pubkey(), true)],
         );
-        v1::Message::try_compile(&keypair.pubkey(), &[instruction], Hash::new_unique()).unwrap()
+        v1::Message::try_compile_with_config(
+            &keypair.pubkey(),
+            &[instruction],
+            Hash::new_unique(),
+            v1_resource_limits(),
+        )
+        .unwrap()
+    }
+
+    /// V1 resource limits have to be set explicitly for a transaction to be executable, so
+    /// every V1 fixture that is meant to be valid carries them.
+    fn v1_resource_limits() -> v1::TransactionConfig {
+        v1::TransactionConfig::empty()
+            .with_compute_unit_limit(200_000)
+            .with_loaded_accounts_data_size_limit(64 * 1024)
     }
 
     #[test]
@@ -130,9 +174,7 @@ mod tests {
 
         let transaction = TransactionUtil::new_unsigned_versioned_transaction(message.clone());
 
-        // Should have correct number of signatures (all default/empty)
         assert_eq!(transaction.signatures.len(), message.header().num_required_signatures as usize);
-        // All signatures should be default (empty)
         for sig in &transaction.signatures {
             assert_eq!(*sig, Signature::default());
         }
@@ -148,7 +190,6 @@ mod tests {
             vec![AccountMeta::new(keypair.pubkey(), true)],
         );
 
-        // Create V0 message
         let v0_message = v0::Message {
             header: solana_message::MessageHeader {
                 num_required_signatures: 1,
@@ -175,7 +216,6 @@ mod tests {
 
     #[test]
     fn test_decode_b64_transaction_legacy_fallback() {
-        // Test that we can decode legacy transactions and convert them to versioned
         let keypair = Keypair::new();
         let instruction = Instruction::new_with_bytes(
             Pubkey::new_unique(),
@@ -231,6 +271,34 @@ mod tests {
         let result = TransactionUtil::decode_b64_transaction(&encoded);
 
         assert!(matches!(result, Err(KoraError::InvalidTransaction(_))));
+    }
+
+    #[test]
+    fn test_decode_b64_transaction_v1_rejects_unset_resource_limits() {
+        let encoded = create_mock_encoded_v1_transaction(v1::TransactionConfig::empty());
+
+        let error = TransactionUtil::decode_b64_transaction(&encoded)
+            .expect_err("an empty V1 config requests zero compute units and zero loaded bytes");
+        let error_message = error.to_string();
+        assert!(error_message.contains("compute_unit_limit"), "unexpected error: {error_message}");
+        assert!(
+            error_message.contains("loaded_accounts_data_size_limit"),
+            "unexpected error: {error_message}"
+        );
+    }
+
+    #[test]
+    fn test_decode_b64_transaction_v1_rejects_unset_loaded_accounts_data_size_limit() {
+        let encoded = create_mock_encoded_v1_transaction(
+            v1::TransactionConfig::empty().with_compute_unit_limit(200_000),
+        );
+
+        let error = TransactionUtil::decode_b64_transaction(&encoded)
+            .expect_err("a V1 config without a data size limit requests zero loaded bytes");
+        assert!(
+            error.to_string().contains("loaded_accounts_data_size_limit"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

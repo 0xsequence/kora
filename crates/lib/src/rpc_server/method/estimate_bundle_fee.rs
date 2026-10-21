@@ -62,10 +62,8 @@ pub async fn estimate_bundle_fee(
         return Err(BundleError::Jito(JitoError::NotEnabled).into());
     }
 
-    // Validate bundle size on ALL transactions first
     BundleValidator::validate_jito_bundle_size(&transactions)?;
 
-    // Extract only the transactions we need to process
     let (transactions_to_process, _index_to_position) =
         BundleProcessor::extract_transactions_to_process(&transactions, sign_only_indices.clone())?;
 
@@ -102,7 +100,6 @@ pub async fn estimate_bundle_fee(
     )
     .await?;
 
-    // Calculate fee in token if requested
     let fee_in_token = FeeConfigUtil::calculate_fee_in_token(
         fee_in_lamports,
         fee_token.as_deref(),
@@ -140,6 +137,7 @@ mod tests {
     use solana_message::{Message, VersionedMessage};
     use solana_sdk::{account::Account, pubkey::Pubkey, signature::Signer};
     use solana_system_interface::instruction::transfer;
+    use solana_transaction::versioned::TransactionVersion;
     use spl_associated_token_account_interface::{
         address::get_associated_token_address_with_program_id,
         instruction::create_associated_token_account_idempotent,
@@ -284,7 +282,6 @@ mod tests {
         let rpc_client =
             Arc::new(RpcMockBuilder::new().with_fee_estimate(5000).with_simulation().build());
 
-        // Single transaction bundle is valid
         let request = EstimateBundleFeeRequest {
             transactions: vec![create_mock_encoded_transaction()],
             fee_token: None,
@@ -304,7 +301,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_estimate_bundle_fee_sig_verify_default() {
-        // Test that sig_verify defaults correctly via serde (defaults to false)
         let json = r#"{"transactions": ["tx1"]}"#;
         let request: EstimateBundleFeeRequest = serde_json::from_str(json).unwrap();
 
@@ -444,7 +440,6 @@ mod tests {
             create_mock_token2022_mint_with_extensions(6, vec![ExtensionType::TransferFeeConfig]);
         let sender_ata_account = create_mock_token_account(&sender.pubkey(), &mint);
 
-        // Mock CacheUtil for getting accounts
         let mint_account_clone = mint_account.clone();
         let cache_ctx = MockCacheUtil::get_account_context();
         cache_ctx.expect().returning(move |_, _, addr: &Pubkey, _| {
@@ -508,5 +503,31 @@ mod tests {
 
         // 16505 = base_fee(5000) + margin(10% of base_fee) + ATA rent + token-2022 transfer fee surcharge
         assert_eq!(result.fee_in_lamports, 16505);
+    }
+
+    #[tokio::test]
+    async fn test_estimate_bundle_fee_rejects_disallowed_transaction_version() {
+        let _m = ConfigMockBuilder::new()
+            .with_bundle_enabled(true)
+            .with_allowed_transaction_versions(vec![TransactionVersion::Number(0)])
+            .build_and_setup();
+        let _ = setup_or_get_test_signer();
+
+        let rpc_client = Arc::new(RpcMockBuilder::new().with_simulation().build());
+
+        let request = EstimateBundleFeeRequest {
+            transactions: vec![create_mock_encoded_transaction()],
+            fee_token: None,
+            signer_key: None,
+            sig_verify: false,
+            sign_only_indices: None,
+        };
+
+        let result = estimate_bundle_fee(&rpc_client, request).await;
+
+        assert_eq!(
+            result.unwrap_err(),
+            KoraError::InvalidTransaction("Transaction version is not allowed".to_string())
+        );
     }
 }

@@ -1,10 +1,6 @@
 import { Instruction, type MicroLamports, type TransactionSigner } from '@solana/kit';
 
 /**
- * Request Types
- */
-
-/**
  * Parameters for signing a transaction.
  */
 export interface SignTransactionRequest {
@@ -127,10 +123,6 @@ export interface GetPaymentInstructionRequest {
 }
 
 /**
- * Response Types
- */
-
-/**
  * Response from signing a transaction.
  */
 export interface SignTransactionResponse {
@@ -138,6 +130,12 @@ export interface SignTransactionResponse {
     signed_transaction: string;
     /** Public key of the signer used to sign the transaction */
     signer_pubkey: string;
+    /**
+     * Whether a Lighthouse fee payer assertion was appended before signing. Reports only
+     * the assertion; the message may differ from the request for other reasons (a request
+     * with an empty signature array gets a fresh blockhash). Sign the returned transaction.
+     */
+    lighthouse_assertion_added: boolean;
 }
 
 /**
@@ -258,10 +256,6 @@ export interface GetPaymentInstructionResponse {
     signer_address: string;
 }
 
-/**
- * Configuration Types
- */
-
 export type PriceSource = 'Jupiter' | 'Mock';
 
 /**
@@ -274,6 +268,8 @@ export interface ValidationConfig {
     allowed_spl_paid_tokens: string[];
     /** List of allowed token mint addresses for fee payment */
     allowed_tokens: string[];
+    /** Transaction message versions the node accepts */
+    allowed_transaction_versions?: ('legacy' | 0 | 1)[];
     /** List of blocked account addresses */
     disallowed_accounts: string[];
     /** Policy controlling fee payer permissions */
@@ -465,10 +461,6 @@ export interface FeePayerPolicy {
 }
 
 /**
- * RPC Types
- */
-
-/**
  * JSON-RPC error object.
  */
 export interface RpcError {
@@ -528,10 +520,6 @@ export interface KoraClientOptions {
     /** URL of the Kora RPC server */
     rpcUrl: string;
 }
-
-/**
- * Plugin Types - Kit-typed responses for the Kora plugin
- */
 
 import type {
     Address,
@@ -600,6 +588,8 @@ export interface KitSignTransactionResponse {
     signed_transaction: Base64EncodedWireTransaction;
     /** Public key of the signer used to sign the transaction */
     signer_pubkey: Address;
+    /** Whether a Lighthouse fee payer assertion was appended before signing */
+    lighthouse_assertion_added: boolean;
 }
 
 /** Plugin response for signAndSendTransaction with Kit types */
@@ -676,6 +666,8 @@ export interface KitValidationConfig {
     allowed_spl_paid_tokens: Address[];
     /** List of allowed token mint addresses for fee payment */
     allowed_tokens: Address[];
+    /** Transaction message versions the node accepts */
+    allowed_transaction_versions?: ('legacy' | 0 | 1)[];
     /** List of blocked account addresses */
     disallowed_accounts: Address[];
     /** Policy controlling fee payer permissions */
@@ -691,10 +683,6 @@ export interface KitValidationConfig {
     /** Token2022 configuration */
     token2022: Token2022Config;
 }
-
-/**
- * Kit Client Types
- */
 
 /**
  * Configuration for the {@link kora} bundle plugin.

@@ -19,13 +19,11 @@ use std::{
 
 const DEFAULT_WEIGHT: u32 = 1;
 
-/// Metadata associated with a signer in the pool
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct HealthState {
     pub(crate) consecutive_failures: u32,
     pub(crate) is_healthy: bool,
     pub(crate) last_failed_at: Option<std::time::Instant>,
-    pub(crate) probe_in_flight: bool,
     pub(crate) probe_started_at: Option<std::time::Instant>,
 }
 
@@ -35,7 +33,6 @@ impl Default for HealthState {
             consecutive_failures: 0,
             is_healthy: true,
             last_failed_at: None,
-            probe_in_flight: false,
             probe_started_at: None,
         }
     }
@@ -69,12 +66,9 @@ impl Clone for SignerWithMetadata {
 }
 
 impl SignerWithMetadata {
-    /// Number of consecutive failures before marking the signer as unhealthy
     const MAX_CONSECUTIVE_FAILURES: u32 = 3;
-    /// Seconds to wait before allowing an unhealthy signer to be probed for recovery
     const RECOVERY_PROBE_SECS: u64 = 30;
 
-    /// Create a new signer with metadata
     pub(crate) fn new(name: String, signer: Arc<Signer>, weight: u32) -> Self {
         Self {
             name,
@@ -85,7 +79,6 @@ impl SignerWithMetadata {
         }
     }
 
-    /// Update the last used timestamp to current time
     fn update_last_used(&self) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -116,7 +109,6 @@ impl SignerWithMetadata {
             }
             health.is_healthy = false;
             health.last_failed_at = Some(std::time::Instant::now());
-            health.probe_in_flight = false;
             health.probe_started_at = None;
         }
     }
@@ -131,28 +123,13 @@ impl SignerWithMetadata {
     }
 
     fn release_stale_probe_lock_if_needed(&self, health: &mut HealthState, probe_lease: Duration) {
-        if !health.probe_in_flight {
-            return;
-        }
-
-        match health.probe_started_at {
-            Some(started_at) if started_at.elapsed() >= probe_lease => {
-                log::warn!(
-                    "Releasing stale probe lock for signer '{}' after {}ms lease timeout",
-                    self.name,
-                    probe_lease.as_millis()
-                );
-                health.probe_in_flight = false;
-                health.probe_started_at = None;
-            }
-            None => {
-                log::warn!(
-                    "Signer '{}' had probe_in_flight=true without probe_started_at; clearing stale lock",
-                    self.name
-                );
-                health.probe_in_flight = false;
-            }
-            _ => {}
+        if health.probe_started_at.is_some_and(|started_at| started_at.elapsed() >= probe_lease) {
+            log::warn!(
+                "Releasing stale probe lock for signer '{}' after {}ms lease timeout",
+                self.name,
+                probe_lease.as_millis()
+            );
+            health.probe_started_at = None;
         }
     }
 
@@ -180,9 +157,7 @@ impl SignerWithMetadata {
             return false;
         }
 
-        health.is_healthy
-            || !health.probe_in_flight
-            || self.is_probe_lock_stale(health, probe_lease)
+        health.is_healthy || self.is_probe_lock_stale(health, probe_lease)
     }
 
     fn is_probe_eligible_with_lock(&self, health: &mut HealthState, probe_lease: Duration) -> bool {
@@ -195,7 +170,7 @@ impl SignerWithMetadata {
         }
 
         self.release_stale_probe_lock_if_needed(health, probe_lease);
-        !health.probe_in_flight
+        health.probe_started_at.is_none()
     }
 
     fn is_eligible_for_selection(&self, probe_lease: Duration) -> bool {
@@ -214,13 +189,11 @@ impl SignerWithMetadata {
         }
 
         log::debug!("Probing recovery for signer '{}'", self.name());
-        health.probe_in_flight = true;
         health.probe_started_at = Some(std::time::Instant::now());
         true
     }
 }
 
-/// A pool of signers with different selection strategies
 pub struct SignerPool {
     /// List of signers with their metadata
     signers: Vec<SignerWithMetadata>,
@@ -272,7 +245,6 @@ impl SignerPool {
         }
     }
 
-    /// Create a new signer pool from configuration
     pub async fn from_config(config: SignerPoolConfig) -> Result<Self, KoraError> {
         if config.signers.is_empty() {
             return Err(KoraError::ValidationError("Cannot create empty signer pool".to_string()));
@@ -512,7 +484,6 @@ impl SignerPool {
         Ok(signers[0])
     }
 
-    /// Get information about all signers in the pool
     pub fn get_signers_info(&self) -> Vec<SignerInfo> {
         self.signers
             .iter()
@@ -525,17 +496,14 @@ impl SignerPool {
             .collect()
     }
 
-    /// Get the number of signers in the pool
     pub fn len(&self) -> usize {
         self.signers.len()
     }
 
-    /// Check if the pool is empty
     pub fn is_empty(&self) -> bool {
         self.signers.is_empty()
     }
 
-    /// Get the configured strategy
     pub fn strategy(&self) -> &SelectionStrategy {
         &self.strategy
     }
@@ -569,7 +537,7 @@ impl SignerPool {
                     pubkey
                 ))
             })?;
-        Ok(signer_meta.health.lock().probe_in_flight)
+        Ok(signer_meta.health.lock().probe_started_at.is_some())
     }
 
     /// Select a signer by public key without mutating recovery probe state.
@@ -621,7 +589,6 @@ mod tests {
     }
 
     fn create_test_pool() -> SignerPool {
-        // Create test signers using external signer library
         let keypair1 = Keypair::new();
         let keypair2 = Keypair::new();
 
@@ -645,16 +612,13 @@ mod tests {
     fn test_round_robin_selection() {
         let pool = create_test_pool();
 
-        // Test that round-robin cycles through signers
         let mut selections = HashMap::new();
         for _ in 0..100 {
             let signer = pool.get_next_signer().unwrap();
             *selections.entry(signer.pubkey().to_string()).or_insert(0) += 1;
         }
 
-        // Should have selected both signers equally
         assert_eq!(selections.len(), 2);
-        // Each signer should be selected 50 times
         assert!(selections.values().all(|&count| count == 50));
     }
 
@@ -667,7 +631,6 @@ mod tests {
         let signer1_pubkey = pool.signers[0].signer.pubkey().to_string();
         let signer2_pubkey = pool.signers[1].signer.pubkey().to_string();
 
-        // Test weighted selection over many iterations
         let mut selections = HashMap::new();
         for _ in 0..300 {
             let signer = pool.get_next_signer().unwrap();
@@ -707,13 +670,13 @@ mod tests {
         assert!(meta.is_healthy());
 
         meta.record_failure();
-        assert!(meta.is_healthy()); // still healthy after 1
+        assert!(meta.is_healthy());
 
         meta.record_failure();
-        assert!(meta.is_healthy()); // still healthy after 2
+        assert!(meta.is_healthy());
 
         meta.record_failure();
-        assert!(!meta.is_healthy()); // unhealthy after 3
+        assert!(!meta.is_healthy());
     }
 
     #[test]
@@ -721,13 +684,11 @@ mod tests {
         let pool = create_test_pool();
         let meta = &pool.signers[0];
 
-        // Mark unhealthy
         meta.record_failure();
         meta.record_failure();
         meta.record_failure();
         assert!(!meta.is_healthy());
 
-        // One success recovers it
         meta.record_success();
         assert!(meta.is_healthy());
     }
@@ -736,7 +697,6 @@ mod tests {
     fn test_healthy_signers_filters_unhealthy() {
         let pool = create_test_pool();
 
-        // Mark first signer unhealthy
         pool.signers[0].record_failure();
         pool.signers[0].record_failure();
         pool.signers[0].record_failure();
@@ -750,7 +710,6 @@ mod tests {
     fn test_error_when_all_signers_unhealthy() {
         let pool = create_test_pool();
 
-        // Mark ALL signers unhealthy
         for signer in &pool.signers {
             signer.record_failure();
             signer.record_failure();
@@ -768,12 +727,10 @@ mod tests {
     fn test_round_robin_skips_unhealthy() {
         let pool = create_test_pool();
 
-        // Mark signer_1 unhealthy
         pool.signers[0].record_failure();
         pool.signers[0].record_failure();
         pool.signers[0].record_failure();
 
-        // All selections should return signer_2
         let signer2_pubkey = pool.signers[1].signer.pubkey().to_string();
         for _ in 0..10 {
             let selected = pool.get_next_signer().unwrap();
@@ -786,13 +743,11 @@ mod tests {
         let pool = create_test_pool();
         let meta = &pool.signers[0];
 
-        // Mark signer_1 unhealthy by forcing 3 failures
         meta.record_failure();
         meta.record_failure();
         meta.record_failure();
         assert!(!meta.is_healthy());
 
-        // Immediately checking healthy signers should exclude signer_1
         let healthy_before_time = pool.eligible_signers().unwrap();
         assert_eq!(healthy_before_time.len(), 1);
         assert_eq!(healthy_before_time[0].name(), "signer_2");
@@ -804,19 +759,17 @@ mod tests {
         // Now healthy_signers() should tentatively ALLOW signer_1 back into the rotation
         // to probe for recovery, even though is_healthy() is strictly still false.
         let healthy_after_time = pool.eligible_signers().unwrap();
-        assert_eq!(healthy_after_time.len(), 2); // Both signers included!
+        assert_eq!(healthy_after_time.len(), 2);
 
         let selected_signer = pool.select_signer_by_pubkey(&meta.signer.pubkey().to_string());
         assert!(selected_signer.is_ok());
-        assert!(!meta.health.lock().probe_in_flight);
+        assert!(meta.health.lock().probe_started_at.is_none());
 
-        // Verify pinned path also allows after 30s mock
         let pinned_signer = pool.get_signer_by_pubkey(&meta.signer.pubkey().to_string());
         assert!(pinned_signer.is_ok());
 
-        // Simulate selection and successful record_success
         meta.record_success();
-        assert!(meta.is_healthy()); // Permanently healthy again
+        assert!(meta.is_healthy());
     }
 
     #[test]
@@ -891,7 +844,7 @@ mod tests {
             Some(std::time::Instant::now() - std::time::Duration::from_secs(31));
 
         assert!(pool.select_signer_by_pubkey(&pubkey).is_ok());
-        assert!(!meta.health.lock().probe_in_flight);
+        assert!(meta.health.lock().probe_started_at.is_none());
         assert!(pool.get_signer_by_pubkey(&pubkey).is_ok());
     }
 
@@ -923,7 +876,7 @@ mod tests {
         // Stale lock should be cleared automatically and signer should become selectable again.
         let healthy_after_lease = pool.eligible_signers().unwrap();
         assert_eq!(healthy_after_lease.len(), 2);
-        assert!(meta.health.lock().probe_in_flight);
+        assert!(meta.health.lock().probe_started_at.is_some());
         assert!(pool.get_signer_by_pubkey(&meta.signer.pubkey().to_string()).is_ok());
     }
 

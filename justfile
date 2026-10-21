@@ -81,29 +81,20 @@ fmt-ts:
 [group('test')]
 [no-exit-message]
 unit-test:
-    -cargo test --lib --workspace --exclude tests --quiet
+    cargo test --lib --workspace --exclude tests --quiet
 
-# Run all integration tests (use --verbose, --force-refresh, --filter X as needed)
+# Run all integration tests (pass cargo test args, e.g. --test rpc)
 [group('test')]
-integration-test *args: build _ensure-transfer-hook
-    cargo run -p tests --bin test_runner -- {{args}}
+integration-test *args='--tests': build
+    cargo test -p tests {{args}}
 
 # Run TypeScript SDK unit tests
 [group('test')]
 [no-exit-message]
 unit-test-ts: build
-    -cd sdks/ts && pnpm test:unit
-
-# Run all TypeScript SDK tests (unit + integration)
-[group('test')]
-[no-exit-message]
-test-ts: build _ensure-transfer-hook
     cd sdks/ts && pnpm test:unit
-    cargo run -p tests --bin test_runner -- --filter typescript_basic
-    cargo run -p tests --bin test_runner -- --filter typescript_auth
-    cargo run -p tests --bin test_runner -- --filter typescript_free
 
-# Run all tests (unit + TypeScript + integration)
+# Run all tests (unit + TypeScript unit + integration)
 [group('test')]
 test: build unit-test unit-test-ts integration-test
 
@@ -126,18 +117,15 @@ fuzz-build:
 fuzz-list:
     cd fuzz && cargo fuzz list
 
+# Regenerate the committed fuzz seed corpus
+[group('fuzz')]
+fuzz-seeds:
+    cd fuzz && cargo run --example gen_seed_corpus
+
 # Build transfer hook test program
 [group('test')]
 build-transfer-hook:
     cd tests/src/common/transfer-hook-example && chmod +x build.sh && ./build.sh
-
-[private]
-_ensure-transfer-hook:
-    #!/usr/bin/env bash
-    if [ ! -f "tests/src/common/transfer-hook-example/target/deploy/transfer_hook_example.so" ]; then
-        echo "Building transfer hook program..."
-        cd tests/src/common/transfer-hook-example && chmod +x build.sh && ./build.sh
-    fi
 
 # ******************************************************************************
 # Run Services
