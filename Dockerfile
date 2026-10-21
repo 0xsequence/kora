@@ -19,7 +19,10 @@ COPY . .
 RUN cargo build --release --bin kora
 
 FROM debian:bookworm-slim
+# eMudhra CA compromise: refuse a CA bundle that still trusts the compromised intermediates.
+ARG CA_CERTIFICATES_MIN=20250419~deb12u2
 RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN dpkg --compare-versions "$(dpkg-query -W -f='${Version}' ca-certificates)" ge "${CA_CERTIFICATES_MIN}"
 COPY --from=builder /usr/src/app/target/release/kora /usr/local/bin/
 
 EXPOSE 8080
