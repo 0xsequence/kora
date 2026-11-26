@@ -4,6 +4,9 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
+overrides:
+  ws@>=8.0.0 <8.21.0: ^8.21.0
+
 importers:
 
   .:
@@ -635,8 +638,8 @@ packages:
   undici-types@7.21.0:
     resolution: {integrity: sha512-w9IMgQrz4O0YN1LtB7K5P63vhlIOvC7opSmouCJ+ZywlPAlO9gIkJ+otk6LvGpAs2wg4econaCz3TvQ9xPoyuQ==}
 
-  ws@8.20.1:
-    resolution: {integrity: sha512-It4dO0K5v//JtTXuPkfEOaI3uUN87iYPnqo/ZzqCoG3g8uhA66QUMs/SrM0YK7/NAu+r4LMh/9dq2A7k+rHs+w==}
+  ws@8.23.0:
+    resolution: {integrity: sha512-wCkmX8QMOrKjgO8HW2WyDbTSGeqkocxgDzS9iR79rEAexty6/2qzilx3Ag8Tqf9ykop3irLKle0MtVn5qjVnoQ==}
     engines: {node: '>=10.0.0'}
     peerDependencies:
       bufferutil: ^4.0.1
@@ -1000,7 +1003,7 @@ snapshots:
       '@solana/functional': 6.0.1(typescript@5.9.2)
       '@solana/rpc-subscriptions-spec': 6.0.1(typescript@5.9.2)
       '@solana/subscribable': 6.0.1(typescript@5.9.2)
-      ws: 8.20.1
+      ws: 8.23.0
     optionalDependencies:
       typescript: 5.9.2
     transitivePeerDependencies:
@@ -1237,4 +1240,4 @@ snapshots:
 
   undici-types@7.21.0: {}
 
-  ws@8.20.1: {}
+  ws@8.23.0: {}
